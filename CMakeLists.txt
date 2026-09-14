@@ -17,5 +17,9 @@ if(BUILD_TESTING)
     add_executable(kv_state_machine_test tests/kv_state_machine_test.cpp)
     target_link_libraries(kv_state_machine_test PRIVATE dkv_core)
     add_test(NAME kv_state_machine_test COMMAND kv_state_machine_test)
+    
+    add_executable(command_codec_test tests/command_codec_test.cpp)
+    target_link_libraries(command_codec_test PRIVATE dkv_core)
+    add_test(NAME command_codec_test COMMAND command_codec_test)
 
 endif()
