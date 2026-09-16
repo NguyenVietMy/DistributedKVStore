@@ -166,16 +166,198 @@ namespace {
             "embedded null bytes were not preserved"
         );
     }
+    void test_put_decoding(){
+            const std::vector<std::byte> bytes{
+                std::byte{0x01}, std::byte{0x01},
+                std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+                std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x02},
+                std::byte{0x61}, std::byte{0x62}, std::byte{0x63}
+            };
+            const dkv::Command expected_command{
+                dkv::CommandType::Put,
+                "a",
+                "bc"
+            };
 
+            const auto result = dkv::decode_command(bytes);
+            const auto* command = std::get_if<dkv::Command>(&result);
+            expect(command != nullptr, "decoding valid Put returned an error");
+            if(command == nullptr){
+                return;
+            }
+            
+            expect(*command == expected_command, "decoded Put does not match");
+    }
+    void test_delete_decoding(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x02}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x61}
+        };
+        const dkv::Command expected_command{
+            dkv::CommandType::Delete,
+            "a",
+            ""
+        };
+
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::Command>(&result);
+        expect(command != nullptr, "decoding valid Delete returned an error");
+        if(command == nullptr){
+            return;
+        }
+
+        expect(*command == expected_command, "decoded Delete does not match");
+    }
+
+    void test_noop_decoding(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x03},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}
+        };
+
+        const dkv::Command expected_command{
+            dkv::CommandType::NoOp,
+            "",
+            ""
+        };
+
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::Command>(&result);
+
+        expect(command != nullptr, "decoding valid NoOp returned an error");
+        if(command == nullptr){
+            return;
+        }
+        expect(*command == expected_command, "decoded NoOp does not match");
+
+    }
+
+    void test_wrong_format_version(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x02}, std::byte{0x03},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::UnsupportedVersion, "Wrong version did not report correct error");
+    }
+    
+    void test_short_input(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x03},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::InputTooShort, "Short input did not report correct error");
+    }
+    void test_unknown_command_type(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x04},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00} 
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::UnknownCommandType, "Unknown command type did not report correct error");
+    }
+
+    void test_truncated_payload(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x01},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::TruncatedPayload, "Truncated payload did not report correct error");
+    }
+
+    void test_trailing_bytes(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x01},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+            std::byte{0x00}
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::TrailingBytes, "Trailing bytes command did not report correct error");
+    }
+
+    void test_invalid_delete_decode(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x02},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+            std::byte{0x61}
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::InvalidCommand, "Invalid delete command did not report correct error");
+    }
+    void test_invalid_noop_decode(){
+        const std::vector<std::byte> bytes{
+            std::byte{0x01}, std::byte{0x03},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+            std::byte{0x61}
+        };
+        const auto result = dkv::decode_command(bytes);
+        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
+        expect(command != nullptr, "decoding wrong command returned an error");
+        if(command == nullptr){
+            return;
+        } 
+        expect(*command == dkv::CommandCodecError::InvalidCommand, "Invalid noop command did not report correct error");
+    }
 }
 
 int main(){
+    test_trailing_bytes();
+    test_invalid_delete_decode();
+    test_invalid_noop_decode();
+    test_unknown_command_type();
+    test_truncated_payload();
+    test_short_input();
+    test_wrong_format_version();
+    test_noop_decoding();
     test_put_encoding();
     test_delete_encoding();
     test_no_op_encoding();
     test_invalid_commands();
     test_embedded_null_bytes();
-
+    test_put_decoding();
+    test_delete_decoding();
     if(failures != 0){
         std::cerr << failures << " test check(s) failed\n";
         return 1;
