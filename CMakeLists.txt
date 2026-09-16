@@ -5,6 +5,7 @@ project(DistributedKVStore LANGUAGES CXX)
 add_library(dkv_core 
     src/kv_state_machine.cpp 
     src/command_codec.cpp
+    src/crc32.cpp
 )
 
 target_include_directories(dkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -21,5 +22,9 @@ if(BUILD_TESTING)
     add_executable(command_codec_test tests/command_codec_test.cpp)
     target_link_libraries(command_codec_test PRIVATE dkv_core)
     add_test(NAME command_codec_test COMMAND command_codec_test)
+
+    add_executable(crc32_test tests/crc32_test.cpp)
+    target_link_libraries(crc32_test PRIVATE dkv_core)
+    add_test(NAME crc32_test COMMAND crc32_test)
 
 endif()
