@@ -45,6 +45,22 @@ namespace {
         );
     }
 
+    void expect_decode_error(
+        const std::vector<std::byte>& bytes,
+        dkv::CommandCodecError expected_error,
+        std::string_view message
+    ){
+        const auto result = dkv::decode_command(bytes);
+        const auto* error = std::get_if<dkv::CommandCodecError>(&result);
+
+        expect(error != nullptr, "decoding invalid bytes returned a command");
+        if(error == nullptr){
+            return;
+        }
+
+        expect(*error == expected_error, message);
+    }
+
     void test_put_encoding(){
         const dkv::Command command{
             dkv::CommandType::Put,
@@ -241,13 +257,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::UnsupportedVersion, "Wrong version did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::UnsupportedVersion,
+            "wrong version did not report UnsupportedVersion"
+        );
     }
     
     void test_short_input(){
@@ -256,13 +270,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::InputTooShort, "Short input did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::InputTooShort,
+            "short input did not report InputTooShort"
+        );
     }
     void test_unknown_command_type(){
         const std::vector<std::byte> bytes{
@@ -270,13 +282,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00} 
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::UnknownCommandType, "Unknown command type did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::UnknownCommandType,
+            "unknown command type did not report UnknownCommandType"
+        );
     }
 
     void test_truncated_payload(){
@@ -285,13 +295,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, 
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::TruncatedPayload, "Truncated payload did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::TruncatedPayload,
+            "truncated payload did not report TruncatedPayload"
+        );
     }
 
     void test_trailing_bytes(){
@@ -301,13 +309,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
             std::byte{0x00}
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::TrailingBytes, "Trailing bytes command did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::TrailingBytes,
+            "trailing bytes did not report TrailingBytes"
+        );
     }
 
     void test_invalid_delete_decode(){
@@ -317,13 +323,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
             std::byte{0x61}
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::InvalidCommand, "Invalid delete command did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::InvalidCommand,
+            "invalid Delete did not report InvalidCommand"
+        );
     }
     void test_invalid_noop_decode(){
         const std::vector<std::byte> bytes{
@@ -332,13 +336,11 @@ namespace {
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
             std::byte{0x61}
         };
-        const auto result = dkv::decode_command(bytes);
-        const auto* command = std::get_if<dkv::CommandCodecError>(&result);
-        expect(command != nullptr, "decoding wrong command returned an error");
-        if(command == nullptr){
-            return;
-        } 
-        expect(*command == dkv::CommandCodecError::InvalidCommand, "Invalid noop command did not report correct error");
+        expect_decode_error(
+            bytes,
+            dkv::CommandCodecError::InvalidCommand,
+            "invalid NoOp did not report InvalidCommand"
+        );
     }
 }
 
