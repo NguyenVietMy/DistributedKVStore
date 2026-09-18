@@ -7,6 +7,7 @@ add_library(dkv_core
     src/command_codec.cpp
     src/crc32.cpp
     src/log_entry_codec.cpp
+    src/persistent_log.cpp
 )
 
 target_include_directories(dkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
