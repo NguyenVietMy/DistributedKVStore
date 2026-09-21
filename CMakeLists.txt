@@ -32,5 +32,9 @@ if(BUILD_TESTING)
     add_executable(log_entry_codec_test tests/log_entry_codec_test.cpp)
     target_link_libraries(log_entry_codec_test PRIVATE dkv_core)
     add_test(NAME log_entry_codec_test COMMAND log_entry_codec_test)
+    
+    add_executable(persistent_log_test tests/persistent_log_test.cpp)
+    target_link_libraries(persistent_log_test PRIVATE dkv_core)
+    add_test(NAME persistent_log_test COMMAND persistent_log_test)
 
 endif()
