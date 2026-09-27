@@ -9,6 +9,8 @@
 #include <span>
 #include "dkv/log_entry_codec.hpp"
 #include <vector>
+#include <limits>
+#include <type_traits>
 
 namespace dkv {
     namespace {
@@ -32,6 +34,38 @@ namespace dkv {
                 }
             }
             return true;
+        }
+        bool write_exact(int file_descriptor, std::span<const std::byte> input, std::uint64_t start_offset){
+            std::size_t total_written = 0;
+            while(total_written < input.size()){
+                const ssize_t bytes_written = ::pwrite(
+                    file_descriptor,
+                    input.data() + total_written,
+                    input.size() - total_written,
+                    static_cast<off_t>(start_offset + total_written)
+                );
+                if(bytes_written > 0){
+                    total_written+= static_cast<std::size_t>(bytes_written);
+                }else if(bytes_written == -1 && errno == EINTR){
+                    continue;
+                }else{
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool sync_file(int fd){
+            for (;;) {
+                if (::fdatasync(fd) == 0) return true;
+                if (errno != EINTR) return false;
+            }
+        }
+        bool restore_file_size(int fd, off_t size) {
+            while (::ftruncate(fd, size) == -1) {
+                if (errno != EINTR) return false;
+            }
+            return sync_file(fd);
         }
     }
     PersistentLog::PersistentLog(int file_descriptor)
@@ -118,5 +152,70 @@ namespace dkv {
             offset+= decoded.bytes_consumed;
         }
         return PersistentLogOpenResult{std::move(log)};
+    }
+
+    PersistentLogAppendResult PersistentLog::append(const LogEntry& entry){
+        if (io_failed_) {
+            return PersistentLogAppendResult::IoError;
+        }
+        if(entry.index != last_index()+1){
+            return PersistentLogAppendResult::UnexpectedIndex;
+        }
+        const auto encoded = encode_log_entry(entry);
+        const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
+        if(bytes == nullptr){
+            return PersistentLogAppendResult::InvalidEntry;
+        }
+        const std::uint64_t start_offset = file_size_;
+        const auto max_size = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+        if (start_offset > max_size ||
+            bytes->size() > max_size - start_offset) {
+            return PersistentLogAppendResult::IoError;
+        }
+        static_assert(std::is_nothrow_move_constructible_v<StoredEntry>);
+        StoredEntry stored_entry{entry, start_offset};
+        entries_.reserve(entries_.size() + 1);
+        if (!write_exact(file_descriptor_, std::span<const std::byte>{*bytes}, start_offset)) {
+            if (!restore_file_size(file_descriptor_, static_cast<off_t>(start_offset))) {
+                io_failed_ = true;
+            }
+            return PersistentLogAppendResult::IoError;
+        }
+        if (!sync_file(file_descriptor_)) {
+            if (!restore_file_size(file_descriptor_, static_cast<off_t>(start_offset))) {
+                io_failed_ = true;
+            }
+            return PersistentLogAppendResult::IoError;
+        }
+        entries_.push_back(std::move(stored_entry));
+        file_size_+=bytes->size();
+        return PersistentLogAppendResult::Appended;
+    }
+    PersistentLogTruncateResult PersistentLog::truncate_suffix(std::uint64_t first_index_to_remove){
+        if (io_failed_) {
+            return PersistentLogTruncateResult::IoError;
+        }
+        const std::uint64_t next_index = last_index() +1;
+        if (first_index_to_remove == 0 || first_index_to_remove > next_index) {
+            return PersistentLogTruncateResult::InvalidIndex;
+        }
+        if (first_index_to_remove == next_index) {
+            return PersistentLogTruncateResult::Truncated; // Nothing to remove.
+        }
+
+        const std::uint64_t new_file_size = entries_[first_index_to_remove - 1].byte_offset;
+        while(::ftruncate(file_descriptor_, static_cast<off_t>(new_file_size)) == -1){
+            if(errno != EINTR){
+                io_failed_ = true;
+                return PersistentLogTruncateResult::IoError;
+            }
+        }
+        if (!sync_file(file_descriptor_)) {
+            io_failed_ = true;
+            return PersistentLogTruncateResult::IoError;
+        }
+        entries_.resize(static_cast<std::size_t>(first_index_to_remove - 1));
+        file_size_ = new_file_size;
+        return PersistentLogTruncateResult::Truncated;
     }
 }

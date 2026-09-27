@@ -20,6 +20,7 @@ namespace {
         }
     }
 
+    /* dkv::PersistentLog::open() tests*/
     void test_open_missing_file_returns_empty_log(){
         std::string unique_filename = "dkv-missing-" + std::to_string(::getpid()) + ".log";
         auto temp_path = std::filesystem::temp_directory_path() / unique_filename;
@@ -436,9 +437,65 @@ namespace {
 
         std::filesystem::remove(blocker_path);
     }
+
+
+
+    /* dkv::PersistentLog::append() tests */
+    void test_append_first_entry(){
+        std::string unique_filename = "dkv-open-log-" + std::to_string(::getpid()) + ".log";
+        const auto temp_path = std::filesystem::temp_directory_path() / unique_filename;
+        std::filesystem::remove(temp_path);
+        auto result = dkv::PersistentLog::open(temp_path);
+        auto* pointer = std::get_if<std::unique_ptr<dkv::PersistentLog>>(&result);
+        expect(pointer != nullptr && *pointer != nullptr, "Opening append test log returned an error");
+
+        if(pointer == nullptr || *pointer == nullptr){
+            std::filesystem::remove(temp_path);
+            return;
+        }
+
+        dkv::LogEntry entry{
+            1,
+            7,
+            dkv::Command{dkv::CommandType::Put, "name", "alice"}
+        };
+        auto append_result = (*pointer)->append(entry);
+        expect(append_result == dkv::PersistentLogAppendResult::Appended, "wrong result for appending");
+        if(append_result != dkv::PersistentLogAppendResult::Appended){
+            pointer->reset();
+            std::filesystem::remove(temp_path);
+            return;
+        }
+        expect((*pointer)->last_index() == 1, "appended log had wrong last index");
+        expect((*pointer)->last_term() == 7, "appended log had wrong last term");
+
+        const auto recovered_entry = (*pointer)->entry_at(1);
+        expect(recovered_entry.has_value(), "appended log did not return an entry at index 1");
+        pointer->reset();
+
+        auto result2 = dkv::PersistentLog::open(temp_path);
+        auto* pointer2 = std::get_if<std::unique_ptr<dkv::PersistentLog>>(&result2);
+        expect(pointer2 != nullptr && *pointer2 != nullptr, "Reopening append test log returned an error.");
+
+        if(pointer2 == nullptr || *pointer2 == nullptr){
+            std::filesystem::remove(temp_path);
+            return;
+        }
+        const auto recovered_entry2 = (*pointer2)->entry_at(1);
+        expect((*pointer2)->last_index() == 1, "appended log had wrong last index");
+        expect((*pointer2)->last_term() == 7, "appended log had wrong last term");
+        expect(recovered_entry2.has_value(), "appended log did not return an entry at index 1");
+        if(recovered_entry2.has_value()){
+            expect(*recovered_entry2 == entry, "Appended entries don't match");
+        }
+        pointer2->reset();
+        std::filesystem::remove(temp_path);
+    }
+
 }
 
 int main(){
+    test_append_first_entry();
     test_open_truncated_record();
     test_open_missing_file_returns_empty_log();
     test_open_empty_file_returns_empty_log();

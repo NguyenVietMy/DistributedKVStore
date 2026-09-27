@@ -52,7 +52,7 @@ namespace dkv {
                 std::uint64_t byte_offset;
             };
             explicit PersistentLog(int file_descriptor);
-
+            bool io_failed_{false};
             int file_descriptor_;
             std::vector<StoredEntry> entries_;
             std::uint64_t file_size_{0};

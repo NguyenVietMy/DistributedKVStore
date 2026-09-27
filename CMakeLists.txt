@@ -37,4 +37,24 @@ if(BUILD_TESTING)
     target_link_libraries(persistent_log_test PRIVATE dkv_core)
     add_test(NAME persistent_log_test COMMAND persistent_log_test)
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(persistent_log_append_test tests/persistent_log_append_test.cpp)
+        target_link_libraries(persistent_log_append_test PRIVATE dkv_core)
+        target_link_options(persistent_log_append_test PRIVATE
+            "LINKER:--wrap=pwrite"
+            "LINKER:--wrap=fdatasync"
+            "LINKER:--wrap=ftruncate"
+        )
+        add_test(NAME persistent_log_append_test COMMAND persistent_log_append_test)
+
+        add_executable(persistent_log_truncate_test tests/persistent_log_truncate_test.cpp)
+        target_link_libraries(persistent_log_truncate_test PRIVATE dkv_core)
+        target_link_options(persistent_log_truncate_test PRIVATE
+            "LINKER:--wrap=ftruncate"
+            "LINKER:--wrap=fdatasync"
+            "LINKER:--wrap=pwrite"
+        )
+        add_test(NAME persistent_log_truncate_test COMMAND persistent_log_truncate_test)
+    endif()
+
 endif()
