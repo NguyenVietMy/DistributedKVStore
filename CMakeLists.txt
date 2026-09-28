@@ -10,6 +10,7 @@ add_library(dkv_core
     src/persistent_log.cpp
     src/persistent_metadata.cpp
     src/raft_vote.cpp
+    src/raft_election.cpp
 )
 
 target_include_directories(dkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -38,6 +39,10 @@ if(BUILD_TESTING)
     add_executable(persistent_metadata_test tests/persistent_metadata_test.cpp)
     target_link_libraries(persistent_metadata_test PRIVATE dkv_core)
     add_test(NAME persistent_metadata_test COMMAND persistent_metadata_test)
+
+    add_executable(raft_election_test tests/raft_election_test.cpp)
+    target_link_libraries(raft_election_test PRIVATE dkv_core)
+    add_test(NAME raft_election_test COMMAND raft_election_test)
 
     add_executable(raft_vote_test tests/raft_vote_test.cpp)
     target_link_libraries(raft_vote_test PRIVATE dkv_core)
