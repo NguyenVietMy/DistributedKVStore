@@ -9,6 +9,7 @@ add_library(dkv_core
     src/log_entry_codec.cpp
     src/persistent_log.cpp
     src/persistent_metadata.cpp
+    src/raft_metadata_codec.cpp
     src/raft_vote.cpp
     src/raft_election.cpp
 )
@@ -36,6 +37,10 @@ if(BUILD_TESTING)
     target_link_libraries(log_entry_codec_test PRIVATE dkv_core)
     add_test(NAME log_entry_codec_test COMMAND log_entry_codec_test)
     
+    add_executable(raft_metadata_codec_test tests/raft_metadata_codec_test.cpp)
+    target_link_libraries(raft_metadata_codec_test PRIVATE dkv_core)
+    add_test(NAME raft_metadata_codec_test COMMAND raft_metadata_codec_test)
+
     add_executable(persistent_metadata_test tests/persistent_metadata_test.cpp)
     target_link_libraries(persistent_metadata_test PRIVATE dkv_core)
     add_test(NAME persistent_metadata_test COMMAND persistent_metadata_test)

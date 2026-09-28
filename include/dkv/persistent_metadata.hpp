@@ -1,19 +1,13 @@
 #pragma once
 
+#include "dkv/raft_metadata.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <optional>
 #include <variant>
 
 namespace dkv {
-    struct RaftMetadata {
-        std::uint64_t current_term{0};
-        std::optional<std::uint64_t> voted_for;
-
-        bool operator==(const RaftMetadata&) const = default;
-    };
-
     enum class PersistentMetadataOpenError {
         IoError,
         TruncatedRecord,

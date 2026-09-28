@@ -1,14 +1,14 @@
 #include "dkv/persistent_metadata.hpp"
 
-#include "dkv/crc32.hpp"
+#include "dkv/raft_metadata_codec.hpp"
 
-#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <optional>
 #include <span>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -17,11 +17,6 @@
 
 namespace dkv {
     namespace {
-        // DKVM | version | term (u64) | vote-present | candidate (u64) | CRC32.
-        // Integers are stored in big-endian order; CRC32 covers all preceding bytes.
-        constexpr std::size_t record_size = 26;
-        constexpr std::size_t checksum_offset = record_size - sizeof(std::uint32_t);
-
         class UniqueFd {
         public:
             explicit UniqueFd(int fd = -1) : fd_(fd) {}
@@ -36,70 +31,6 @@ namespace dkv {
 
         std::filesystem::path parent_of(const std::filesystem::path& path) {
             return path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
-        }
-
-        void put_u64(std::span<std::byte> bytes, std::uint64_t value) {
-            for (std::size_t i = 0; i < 8; ++i) {
-                bytes[i] = static_cast<std::byte>(value >> (56 - i * 8));
-            }
-        }
-
-        std::uint64_t get_u64(std::span<const std::byte> bytes) {
-            std::uint64_t value = 0;
-            for (std::size_t i = 0; i < 8; ++i) {
-                value = (value << 8) | std::to_integer<std::uint8_t>(bytes[i]);
-            }
-            return value;
-        }
-
-        std::array<std::byte, record_size> encode(const RaftMetadata& state) {
-            std::array<std::byte, record_size> bytes{};
-            bytes[0] = std::byte{'D'};
-            bytes[1] = std::byte{'K'};
-            bytes[2] = std::byte{'V'};
-            bytes[3] = std::byte{'M'};
-            bytes[4] = std::byte{1};
-            put_u64(std::span<std::byte>{bytes}.subspan(5, 8), state.current_term);
-            bytes[13] = state.voted_for.has_value() ? std::byte{1} : std::byte{0};
-            if (state.voted_for) {
-                put_u64(std::span<std::byte>{bytes}.subspan(14, 8), *state.voted_for);
-            }
-            const auto checksum = crc32(std::span<const std::byte>{bytes}.first(checksum_offset));
-            for (std::size_t i = 0; i < 4; ++i) {
-                bytes[checksum_offset + i] = static_cast<std::byte>(checksum >> (24 - i * 8));
-            }
-            return bytes;
-        }
-
-        std::variant<RaftMetadata, PersistentMetadataOpenError> decode(
-            const std::array<std::byte, record_size>& bytes) {
-            if (bytes[0] != std::byte{'D'} || bytes[1] != std::byte{'K'} ||
-                bytes[2] != std::byte{'V'} || bytes[3] != std::byte{'M'}) {
-                return PersistentMetadataOpenError::CorruptRecord;
-            }
-            if (bytes[4] != std::byte{1}) {
-                return PersistentMetadataOpenError::UnsupportedVersion;
-            }
-            std::uint32_t stored_checksum = 0;
-            for (std::size_t i = 0; i < 4; ++i) {
-                stored_checksum = (stored_checksum << 8) |
-                    std::to_integer<std::uint8_t>(bytes[checksum_offset + i]);
-            }
-            if (stored_checksum != crc32(std::span<const std::byte>{bytes}.first(checksum_offset))) {
-                return PersistentMetadataOpenError::CorruptRecord;
-            }
-            const auto term = get_u64(std::span<const std::byte>{bytes}.subspan(5, 8));
-            const auto presence = bytes[13];
-            if (presence != std::byte{0} && presence != std::byte{1}) {
-                return PersistentMetadataOpenError::CorruptRecord;
-            }
-            const auto candidate = get_u64(std::span<const std::byte>{bytes}.subspan(14, 8));
-            if ((presence == std::byte{0} && candidate != 0) ||
-                (presence == std::byte{1} && term == 0)) {
-                return PersistentMetadataOpenError::CorruptRecord;
-            }
-            return RaftMetadata{term, presence == std::byte{1}
-                ? std::optional<std::uint64_t>{candidate} : std::nullopt};
         }
 
         bool read_exact(int fd, std::span<std::byte> output) {
@@ -165,16 +96,24 @@ namespace dkv {
         if (::fstat(file.get(), &file_info) == -1 || !S_ISREG(file_info.st_mode)) {
             return PersistentMetadataOpenError::IoError;
         }
-        if (file_info.st_size < static_cast<off_t>(record_size)) {
+        if (file_info.st_size < static_cast<off_t>(raft_metadata_record_size)) {
             return PersistentMetadataOpenError::TruncatedRecord;
         }
-        if (file_info.st_size != static_cast<off_t>(record_size)) {
+        if (file_info.st_size != static_cast<off_t>(raft_metadata_record_size)) {
             return PersistentMetadataOpenError::CorruptRecord;
         }
-        std::array<std::byte, record_size> bytes{};
+        RaftMetadataRecord bytes{};
         if (!read_exact(file.get(), bytes)) return PersistentMetadataOpenError::IoError;
-        auto decoded = decode(bytes);
-        if (const auto* error = std::get_if<PersistentMetadataOpenError>(&decoded)) return *error;
+        auto decoded = decode_raft_metadata(bytes);
+        if (const auto* error = std::get_if<RaftMetadataCodecError>(&decoded)) {
+            if (*error == RaftMetadataCodecError::TruncatedRecord) {
+                return PersistentMetadataOpenError::TruncatedRecord;
+            }
+            if (*error == RaftMetadataCodecError::UnsupportedVersion) {
+                return PersistentMetadataOpenError::UnsupportedVersion;
+            }
+            return PersistentMetadataOpenError::CorruptRecord;
+        }
         // An earlier process may have replaced the file but failed to sync its directory.
         // Certify the recovered state before the caller can use it for Raft decisions.
         if (!sync_file(file.get()) || !sync_directory(directory.get())) {
@@ -202,6 +141,10 @@ namespace dkv {
     }
 
     PersistentMetadataUpdateResult PersistentMetadata::persist(const RaftMetadata& next_state) {
+        const auto encoded = encode_raft_metadata(next_state);
+        const auto* bytes = std::get_if<RaftMetadataRecord>(&encoded);
+        if (bytes == nullptr) return PersistentMetadataUpdateResult::IoError;
+
         UniqueFd directory{::open(parent_of(path_).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
         if (directory.get() < 0) return PersistentMetadataUpdateResult::IoError;
 
@@ -212,8 +155,7 @@ namespace dkv {
         if (temp.get() < 0) return PersistentMetadataUpdateResult::IoError;
         const auto discard_temp = [&] { ::unlink(temp_name.data()); };
 
-        const auto bytes = encode(next_state);
-        if (!write_exact(temp.get(), bytes) || !sync_file(temp.get())) {
+        if (!write_exact(temp.get(), *bytes) || !sync_file(temp.get())) {
             discard_temp();
             return PersistentMetadataUpdateResult::IoError;
         }
