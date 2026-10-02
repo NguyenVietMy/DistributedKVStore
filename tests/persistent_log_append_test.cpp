@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <utility>
@@ -19,7 +20,11 @@ namespace {
         SyncError,
         SyncInterrupted,
         TruncateError,
-        RollbackSyncError
+        RollbackSyncError,
+        OpenFileSyncError,
+        OpenDirectorySyncError,
+        OpenFileSyncInterrupted,
+        OpenDirectorySyncInterrupted
     };
 
     struct FaultState {
@@ -27,6 +32,8 @@ namespace {
         int write_calls{0};
         int sync_calls{0};
         int truncate_calls{0};
+        int file_fsync_calls{0};
+        int directory_fsync_calls{0};
     } fault;
 
     int failures = 0;
@@ -73,6 +80,7 @@ namespace {
 extern "C" ssize_t __real_pwrite(int fd, const void* buffer, size_t count, off_t offset);
 extern "C" int __real_fdatasync(int fd);
 extern "C" int __real_ftruncate(int fd, off_t size);
+extern "C" int __real_fsync(int fd);
 
 extern "C" ssize_t __wrap_pwrite(int fd, const void* buffer, size_t count, off_t offset) {
     ++fault.write_calls;
@@ -109,7 +117,75 @@ extern "C" int __wrap_ftruncate(int fd, off_t size) {
     return __real_ftruncate(fd, size);
 }
 
+extern "C" int __wrap_fsync(int fd) {
+    struct stat info{};
+    if (::fstat(fd, &info) == -1) return __real_fsync(fd);
+
+    const bool directory = S_ISDIR(info.st_mode);
+    int& calls = directory ? fault.directory_fsync_calls : fault.file_fsync_calls;
+    ++calls;
+    if ((directory && fault.mode == FaultMode::OpenDirectorySyncInterrupted && calls == 1) ||
+        (!directory && fault.mode == FaultMode::OpenFileSyncInterrupted && calls == 1)) {
+        errno = EINTR;
+        return -1;
+    }
+    if ((directory && fault.mode == FaultMode::OpenDirectorySyncError) ||
+        (!directory && fault.mode == FaultMode::OpenFileSyncError)) {
+        errno = EIO;
+        return -1;
+    }
+    return __real_fsync(fd);
+}
+
 namespace {
+    void test_open_syncs_file_and_directory() {
+        TempLog temp{"open-syncs-name"};
+        inject(FaultMode::None);
+        auto log = open_log(temp.path);
+        const int file_calls = fault.file_fsync_calls;
+        const int directory_calls = fault.directory_fsync_calls;
+        inject(FaultMode::None);
+        if (!log) return;
+        expect(file_calls == 1 && directory_calls == 1,
+               "first open did not sync the file and parent directory");
+    }
+
+    void test_open_sync_failure_can_be_retried(FaultMode mode, std::string_view name) {
+        TempLog temp{name};
+        inject(mode);
+        auto result = dkv::PersistentLog::open(temp.path);
+        const int file_calls = fault.file_fsync_calls;
+        const int directory_calls = fault.directory_fsync_calls;
+        inject(FaultMode::None);
+
+        const auto* error = std::get_if<dkv::PersistentLogOpenError>(&result);
+        expect(error && *error == dkv::PersistentLogOpenError::IoError,
+               "failed open sync did not return IoError");
+        expect(file_calls == 1 &&
+               directory_calls == (mode == FaultMode::OpenDirectorySyncError ? 1 : 0),
+               "open sync failure happened at the wrong stage");
+        expect(std::filesystem::exists(temp.path),
+               "failed open did not leave a file for the retry test");
+
+        auto log = open_log(temp.path);
+        expect(log && fault.file_fsync_calls == 1 && fault.directory_fsync_calls == 1,
+               "retry did not certify the file and directory before returning");
+        inject(FaultMode::None);
+    }
+
+    void test_interrupted_open_sync_is_retried(FaultMode mode, std::string_view name) {
+        TempLog temp{name};
+        inject(mode);
+        auto log = open_log(temp.path);
+        const int file_calls = fault.file_fsync_calls;
+        const int directory_calls = fault.directory_fsync_calls;
+        inject(FaultMode::None);
+        expect(log != nullptr &&
+               file_calls == (mode == FaultMode::OpenFileSyncInterrupted ? 2 : 1) &&
+               directory_calls == (mode == FaultMode::OpenDirectorySyncInterrupted ? 2 : 1),
+               "interrupted open sync was not retried");
+    }
+
     void test_multiple_appends_survive_reopen() {
         TempLog temp{"multiple-appends"};
         const dkv::LogEntry first{1, 4, {dkv::CommandType::Put, "name", "alice"}};
@@ -286,6 +362,13 @@ namespace {
 }
 
 int main() {
+    test_open_syncs_file_and_directory();
+    test_open_sync_failure_can_be_retried(FaultMode::OpenFileSyncError, "open-file-sync-error");
+    test_open_sync_failure_can_be_retried(FaultMode::OpenDirectorySyncError, "open-dir-sync-error");
+    test_interrupted_open_sync_is_retried(FaultMode::OpenFileSyncInterrupted,
+                                          "open-file-sync-interrupted");
+    test_interrupted_open_sync_is_retried(FaultMode::OpenDirectorySyncInterrupted,
+                                          "open-dir-sync-interrupted");
     test_multiple_appends_survive_reopen();
     test_partial_write_rolls_back_and_allows_retry();
     test_sync_error_rolls_back_and_allows_retry();

@@ -61,6 +61,12 @@ namespace dkv {
                 if (errno != EINTR) return false;
             }
         }
+        bool sync_descriptor(int fd) {
+            for (;;) {
+                if (::fsync(fd) == 0) return true;
+                if (errno != EINTR) return false;
+            }
+        }
         bool restore_file_size(int fd, off_t size) {
             while (::ftruncate(fd, size) == -1) {
                 if (errno != EINTR) return false;
@@ -110,6 +116,21 @@ namespace dkv {
             return PersistentLogOpenError::IoError;
         }
         if(file_info.st_size < 0){
+            return PersistentLogOpenError::IoError;
+        }
+
+        // A newly created log's name is not durable until its parent directory
+        // is synced. Do this on every open so a retry also certifies a file left
+        // behind by an earlier failed directory sync.
+        const auto parent = path.parent_path().empty()
+            ? std::filesystem::path{"."} : path.parent_path();
+        const int directory_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory_fd == -1) {
+            return PersistentLogOpenError::IoError;
+        }
+        const bool synced = sync_descriptor(fd) && sync_descriptor(directory_fd);
+        const int close_result = ::close(directory_fd);
+        if (!synced || close_result == -1) {
             return PersistentLogOpenError::IoError;
         }
 

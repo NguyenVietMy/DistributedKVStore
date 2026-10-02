@@ -78,6 +78,7 @@ if(BUILD_TESTING)
         target_link_options(persistent_log_append_test PRIVATE
             "LINKER:--wrap=pwrite"
             "LINKER:--wrap=fdatasync"
+            "LINKER:--wrap=fsync"
             "LINKER:--wrap=ftruncate"
         )
         add_test(NAME persistent_log_append_test COMMAND persistent_log_append_test)
