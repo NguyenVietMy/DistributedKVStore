@@ -46,6 +46,8 @@ namespace dkv {
             std::uint64_t peer_id, const RequestVoteReply& reply);
         [[nodiscard]] RaftRole role() const noexcept;
         [[nodiscard]] unsigned granted_votes() const noexcept;
+        [[nodiscard]] std::uint64_t self_id() const noexcept;
+        [[nodiscard]] std::array<std::uint64_t, 2> peer_ids() const noexcept;
 
         RaftElection(const RaftElection&) = delete;
         RaftElection& operator=(const RaftElection&) = delete;

@@ -32,6 +32,12 @@ namespace dkv {
         return role() == RaftRole::Follower ? 0 : granted_votes_;
     }
 
+    std::uint64_t RaftElection::self_id() const noexcept { return self_id_; }
+
+    std::array<std::uint64_t, 2> RaftElection::peer_ids() const noexcept {
+        return peer_ids_;
+    }
+
     void RaftElection::become_follower() noexcept {
         role_ = RaftRole::Follower;
         election_term_ = 0;

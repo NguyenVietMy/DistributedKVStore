@@ -13,6 +13,8 @@ add_library(dkv_core
     src/raft_vote.cpp
     src/raft_election.cpp
     src/raft_append.cpp
+    src/raft_leader.cpp
+    src/raft_apply.cpp
 )
 
 target_include_directories(dkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -53,6 +55,14 @@ if(BUILD_TESTING)
     add_executable(raft_append_test tests/raft_append_test.cpp)
     target_link_libraries(raft_append_test PRIVATE dkv_core)
     add_test(NAME raft_append_test COMMAND raft_append_test)
+
+    add_executable(raft_leader_test tests/raft_leader_test.cpp)
+    target_link_libraries(raft_leader_test PRIVATE dkv_core)
+    add_test(NAME raft_leader_test COMMAND raft_leader_test)
+
+    add_executable(raft_apply_test tests/raft_apply_test.cpp)
+    target_link_libraries(raft_apply_test PRIVATE dkv_core)
+    add_test(NAME raft_apply_test COMMAND raft_apply_test)
 
     add_executable(raft_vote_test tests/raft_vote_test.cpp)
     target_link_libraries(raft_vote_test PRIVATE dkv_core)
