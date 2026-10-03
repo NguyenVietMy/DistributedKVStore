@@ -85,6 +85,9 @@ namespace dkv {
         // Proposes a PUT or DELETE. Completion belongs to the caller after
         // the returned index appears in applied; this call is not an ACK.
         [[nodiscard]] RaftNodeResult propose(const Command& command);
+        // Appends a current-term no-op. A read may use the local state only
+        // after this index appears in applied while leadership is unchanged.
+        [[nodiscard]] RaftNodeResult read_barrier();
 
         [[nodiscard]] std::uint64_t id() const noexcept;
         [[nodiscard]] RaftRole role() const noexcept;
@@ -110,6 +113,7 @@ namespace dkv {
         [[nodiscard]] bool is_peer(std::uint64_t peer_id) const noexcept;
         [[nodiscard]] bool queue_append(std::uint64_t peer_id, RaftNodeActions& actions);
         [[nodiscard]] bool apply_ready(RaftNodeActions& actions);
+        [[nodiscard]] RaftNodeResult append_as_leader(const Command& command);
         [[nodiscard]] RaftNodeResult stop(RaftNodeError error);
 
         std::uint64_t self_id_;

@@ -271,6 +271,16 @@ namespace dkv {
         if (stopped_) return RaftNodeError::Stopped;
         if (!leader_ || !leader_->active()) return RaftNodeError::NotLeader;
         if (command.type == CommandType::NoOp) return RaftNodeError::InvalidCommand;
+        return append_as_leader(command);
+    }
+
+    RaftNodeResult RaftNode::read_barrier() {
+        return append_as_leader({CommandType::NoOp, "", ""});
+    }
+
+    RaftNodeResult RaftNode::append_as_leader(const Command& command) {
+        if (stopped_) return RaftNodeError::Stopped;
+        if (!leader_ || !leader_->active()) return RaftNodeError::NotLeader;
         const auto result = leader_->append_command(command);
         if (const auto* error = std::get_if<LeaderReplicationError>(&result)) {
             if (*error == LeaderReplicationError::InvalidCommand) {

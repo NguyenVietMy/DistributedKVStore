@@ -60,10 +60,51 @@ namespace {
                    "unknown write status was accepted");
         }
     }
+
+    void test_read_messages() {
+        const dkv::ClientReadRequest request{"empty-value"};
+        const auto encoded_request = dkv::encode_client_read_request(request);
+        const auto* request_bytes =
+            std::get_if<std::vector<std::byte>>(&encoded_request);
+        expect(request_bytes != nullptr, "could not encode GET request");
+        if (request_bytes) {
+            expect(dkv::decode_client_read_request(*request_bytes) ==
+                       dkv::DecodeClientReadRequestResult{request},
+                   "GET request did not round trip");
+            auto malformed = *request_bytes;
+            malformed.pop_back();
+            expect(std::holds_alternative<dkv::ClientWireError>(
+                       dkv::decode_client_read_request(malformed)),
+                   "truncated GET key was accepted");
+        }
+
+        for (const auto& reply : {
+                 dkv::ClientReadReply{dkv::ClientReadStatus::Found, 3, 4, 1,
+                                      std::string{}},
+                 dkv::ClientReadReply{dkv::ClientReadStatus::Found, 3, 4, 1,
+                                      std::string{"value"}},
+                 dkv::ClientReadReply{dkv::ClientReadStatus::NotFound, 3, 4, 1,
+                                      std::nullopt},
+                 dkv::ClientReadReply{dkv::ClientReadStatus::NotLeader, 3, 0, 1,
+                                      std::nullopt}}) {
+            const auto encoded = dkv::encode_client_read_reply(reply);
+            const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
+            expect(bytes != nullptr, "could not encode GET reply");
+            if (!bytes) continue;
+            expect(dkv::decode_client_read_reply(*bytes) ==
+                       dkv::DecodeClientReadReplyResult{reply},
+                   "GET reply did not round trip");
+        }
+        expect(dkv::encode_client_read_reply(
+                   {dkv::ClientReadStatus::Found, 3, 4, 1, std::nullopt}) ==
+                   dkv::EncodeClientResult{dkv::ClientWireError::InvalidMessage},
+               "GET found reply without a value was accepted");
+    }
 }
 
 int main() {
     test_requests();
     test_replies();
+    test_read_messages();
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

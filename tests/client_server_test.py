@@ -1,4 +1,4 @@
-"""End-to-end client writes: commit, follower rejection, and uncertain outcome."""
+"""End-to-end writes and linearizable reads through the client protocol."""
 
 import os
 import re
@@ -94,9 +94,20 @@ def main(server_executable, client_executable):
             assert committed.returncode == 0 and "committed term" in committed.stdout, committed
             term = int(re.search(r"committed term (\d+)", committed.stdout).group(1))
             collect_until(lambda: all("applied index 2" in seen[i] for i in active))
-            deleted = client(leader, "delete", "x")
-            assert deleted.returncode == 0 and "index 3" in deleted.stdout, deleted
+            stale_read = client(follower, "get", "x")
+            assert stale_read.returncode == 3 and "not leader" in stale_read.stdout, stale_read
+            found = client(leader, "get", "x")
+            assert found.returncode == 0 and found.stdout == "10\n", found
             collect_until(lambda: all("applied index 3" in seen[i] for i in active))
+            missing = client(leader, "get", "missing")
+            assert missing.returncode == 0 and missing.stdout == "(not found)\n", missing
+            collect_until(lambda: all("applied index 4" in seen[i] for i in active))
+            deleted = client(leader, "delete", "x")
+            assert deleted.returncode == 0 and "index 5" in deleted.stdout, deleted
+            collect_until(lambda: all("applied index 5" in seen[i] for i in active))
+            after_delete = client(leader, "get", "x")
+            assert after_delete.returncode == 0 and after_delete.stdout == "(not found)\n", after_delete
+            collect_until(lambda: all("applied index 6" in seen[i] for i in active))
 
             for node_id in list(active):
                 if node_id == leader:
@@ -106,14 +117,20 @@ def main(server_executable, client_executable):
                 selector.unregister(processes[node_id].stdout)
                 active.remove(node_id)
 
-            waiting = subprocess.Popen(
+            waiting_read = subprocess.Popen(
+                [str(client_executable), str(ports[leader - 1]), "get", "x"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            waiting_write = subprocess.Popen(
                 [str(client_executable), str(ports[leader - 1]),
                  "put", "x", "uncertain"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                collect_until(lambda: "proposed index 4" in seen[leader])
-                assert waiting.poll() is None, "client was acknowledged without a majority"
+                collect_until(lambda: "proposed index 7" in seen[leader] and
+                              "proposed index 8" in seen[leader])
+                assert waiting_read.poll() is None, "GET completed without a majority"
+                assert waiting_write.poll() is None, "PUT was acknowledged without a majority"
 
                 # The reported peer has a newer term but a stale log: the vote
                 # is denied, yet the old leader must step down and fail pending writes.
@@ -121,15 +138,19 @@ def main(server_executable, client_executable):
                 vote = struct.pack(">BBQQQQQ", 1, 1, sender, term + 1, sender, 0, 0)
                 with socket.create_connection(("127.0.0.1", ports[leader - 1]), 2) as sock:
                     sock.sendall(struct.pack(">I", len(vote)) + vote)
-                output, error = waiting.communicate(timeout=4)
-                assert waiting.returncode == 4 and "outcome unknown" in output, (
-                    waiting.returncode, output, error, seen)
+                read_output, read_error = waiting_read.communicate(timeout=4)
+                assert waiting_read.returncode == 3 and "not leader" in read_output, (
+                    waiting_read.returncode, read_output, read_error, seen)
+                output, error = waiting_write.communicate(timeout=4)
+                assert waiting_write.returncode == 4 and "outcome unknown" in output, (
+                    waiting_write.returncode, output, error, seen)
                 rejected_again = client(leader, "put", "x", "after-stepdown")
                 assert rejected_again.returncode == 3, rejected_again
             finally:
-                if waiting.poll() is None:
-                    waiting.kill()
-                    waiting.wait()
+                for waiting in (waiting_read, waiting_write):
+                    if waiting.poll() is None:
+                        waiting.kill()
+                        waiting.wait()
         finally:
             for process in processes.values():
                 if process.poll() is None:

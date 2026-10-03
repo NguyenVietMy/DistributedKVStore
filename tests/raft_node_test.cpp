@@ -314,6 +314,62 @@ namespace {
                    denied_actions->reset_election_timer,
                "higher-term rejection did not step down and reset election timer");
     }
+
+    void test_read_barrier_waits_for_majority() {
+        ElectedCluster cluster;
+        const auto elected = cluster.elect_a();
+        if (!elected) return;
+        const auto follower_barrier = cluster.b.node->read_barrier();
+        expect(std::get_if<dkv::RaftNodeError>(&follower_barrier) &&
+                   std::get<dkv::RaftNodeError>(follower_barrier) ==
+                       dkv::RaftNodeError::NotLeader,
+               "follower accepted a read barrier");
+        const auto first = message_to<dkv::AppendEntries>(*elected, 2);
+        if (!first) return;
+        const auto barrier = cluster.a.node->read_barrier();
+        const auto* barrier_actions = actions(barrier, "A did not propose read barrier");
+        if (!barrier_actions) return;
+        expect(barrier_actions->proposed_index == 2 &&
+                   cluster.a.node->last_index() == 2 &&
+                   cluster.a.node->last_applied() == 0,
+               "read barrier was applied without a majority");
+
+        const auto first_on_b = cluster.b.node->on_append_entries(1, *first);
+        const auto* first_actions = actions(first_on_b, "B did not store first no-op");
+        if (!first_actions) return;
+        const auto first_ack = message_to<dkv::AppendEntriesReply>(*first_actions, 1);
+        if (!first_ack) return;
+        const auto first_committed =
+            cluster.a.node->on_append_reply(2, *first, *first_ack);
+        const auto* committed_actions =
+            actions(first_committed, "A did not commit leadership no-op");
+        if (!committed_actions) return;
+        const auto barrier_append =
+            message_to<dkv::AppendEntries>(*committed_actions, 2);
+        if (!barrier_append) return;
+        expect(cluster.a.node->commit_index() == 1 &&
+                   barrier_append->entries.size() == 1 &&
+                   barrier_append->entries[0].index == 2 &&
+                   barrier_append->entries[0].command.type ==
+                       dkv::CommandType::NoOp,
+               "read barrier was not replicated as a current-term no-op");
+
+        const auto barrier_on_b = cluster.b.node->on_append_entries(1, *barrier_append);
+        const auto* stored_actions = actions(barrier_on_b, "B did not store barrier");
+        if (!stored_actions) return;
+        const auto barrier_ack =
+            message_to<dkv::AppendEntriesReply>(*stored_actions, 1);
+        if (!barrier_ack) return;
+        const auto applied =
+            cluster.a.node->on_append_reply(2, *barrier_append, *barrier_ack);
+        const auto* applied_actions =
+            actions(applied, "A did not process barrier acknowledgment");
+        expect(applied_actions && cluster.a.node->commit_index() == 2 &&
+                   cluster.a.node->last_applied() == 2 &&
+                   applied_actions->applied ==
+                       std::vector<dkv::AppliedLogEntry>{{2, dkv::ApplyResult::Applied}},
+               "read barrier completed before or after the wrong commit point");
+    }
 }
 
 int main() {
@@ -322,6 +378,7 @@ int main() {
     test_client_write_applies_only_after_majority_ack();
     test_higher_term_reply_steps_down_and_persists_term();
     test_higher_term_vote_request_resets_timer_even_when_denied();
+    test_read_barrier_waits_for_majority();
     if (failures != 0) std::cerr << failures << " Raft node tests failed\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

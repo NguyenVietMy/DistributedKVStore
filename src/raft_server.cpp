@@ -113,6 +113,17 @@ namespace {
                write_all(fd, bytes->data(), bytes->size());
     }
 
+    bool send_client_read_reply(int fd, const dkv::ClientReadReply& reply) {
+        const auto encoded = dkv::encode_client_read_reply(reply);
+        const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
+        if (!bytes) return false;
+        timeval timeout{0, 300000};
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        const auto prefix = length_prefix(bytes->size());
+        return write_all(fd, prefix.data(), prefix.size()) &&
+               write_all(fd, bytes->data(), bytes->size());
+    }
+
     enum class SendResult { Sent, Unavailable, InvalidMessage };
 
     SendResult send_frame(std::uint16_t port, const dkv::RaftEnvelope& envelope) {
@@ -206,9 +217,10 @@ namespace {
         }
 
     private:
-        struct PendingWrite {
+        struct PendingClient {
             std::unique_ptr<Socket> connection;
             std::uint64_t term;
+            std::optional<std::string> read_key;
         };
 
         void reset_election_timer() {
@@ -240,12 +252,20 @@ namespace {
             }
             for (const auto& entry : actions->applied) {
                 std::cout << "applied index " << entry.index << std::endl;
-                const auto pending = pending_writes_.find(entry.index);
-                if (pending != pending_writes_.end()) {
-                    send_client_reply(pending->second.connection->get(),
-                        {dkv::ClientWriteStatus::Committed,
-                         pending->second.term, entry.index, node_->id()});
-                    pending_writes_.erase(pending);
+                const auto pending = pending_clients_.find(entry.index);
+                if (pending != pending_clients_.end()) {
+                    if (pending->second.read_key) {
+                        const auto value = node_->get(*pending->second.read_key);
+                        send_client_read_reply(pending->second.connection->get(),
+                            {value ? dkv::ClientReadStatus::Found
+                                   : dkv::ClientReadStatus::NotFound,
+                             pending->second.term, entry.index, node_->id(), value});
+                    } else {
+                        send_client_reply(pending->second.connection->get(),
+                            {dkv::ClientWriteStatus::Committed,
+                             pending->second.term, entry.index, node_->id()});
+                    }
+                    pending_clients_.erase(pending);
                 }
             }
             for (const auto& outbound : actions->messages) {
@@ -267,29 +287,43 @@ namespace {
         }
 
         void fail_pending() {
-            for (auto& [index, pending] : pending_writes_) {
-                send_client_reply(pending.connection->get(),
-                    {dkv::ClientWriteStatus::OutcomeUnknown,
-                     pending.term, index, node_->known_leader().value_or(0)});
+            for (auto& [index, pending] : pending_clients_) {
+                if (pending.read_key) {
+                    send_client_read_reply(pending.connection->get(),
+                        {dkv::ClientReadStatus::InternalError,
+                         pending.term, index, node_->known_leader().value_or(0),
+                         std::nullopt});
+                } else {
+                    send_client_reply(pending.connection->get(),
+                        {dkv::ClientWriteStatus::OutcomeUnknown,
+                         pending.term, index, node_->known_leader().value_or(0)});
+                }
             }
-            pending_writes_.clear();
+            pending_clients_.clear();
         }
 
         void expire_pending() {
-            for (auto it = pending_writes_.begin(); it != pending_writes_.end();) {
+            for (auto it = pending_clients_.begin(); it != pending_clients_.end();) {
                 if (node_->role() == dkv::RaftRole::Leader &&
                     it->second.term == node_->term()) {
                     ++it;
                     continue;
                 }
-                send_client_reply(it->second.connection->get(),
-                    {dkv::ClientWriteStatus::OutcomeUnknown, it->second.term,
-                     it->first, node_->known_leader().value_or(0)});
-                it = pending_writes_.erase(it);
+                if (it->second.read_key) {
+                    send_client_read_reply(it->second.connection->get(),
+                        {dkv::ClientReadStatus::NotLeader, node_->term(), 0,
+                         node_->known_leader().value_or(0), std::nullopt});
+                } else {
+                    send_client_reply(it->second.connection->get(),
+                        {dkv::ClientWriteStatus::OutcomeUnknown, it->second.term,
+                         it->first, node_->known_leader().value_or(0)});
+                }
+                it = pending_clients_.erase(it);
             }
         }
 
-        void handle_client(Socket& connection, std::span<const std::byte> bytes) {
+        void handle_client_write(Socket& connection,
+                                 std::span<const std::byte> bytes) {
             const auto decoded = dkv::decode_client_request(bytes);
             const auto* request = std::get_if<dkv::ClientWriteRequest>(&decoded);
             if (!request) {
@@ -303,7 +337,7 @@ namespace {
                      node_->known_leader().value_or(0)});
                 return;
             }
-            if (pending_writes_.size() >= 1024) {
+            if (pending_clients_.size() >= 1024) {
                 send_client_reply(connection.get(),
                     {dkv::ClientWriteStatus::Busy, node_->term(), 0, node_->id()});
                 return;
@@ -325,8 +359,53 @@ namespace {
                 }
                 return;
             }
-            pending_writes_.emplace(*actions->proposed_index,
-                PendingWrite{std::make_unique<Socket>(connection.release()), term});
+            pending_clients_.emplace(*actions->proposed_index,
+                PendingClient{std::make_unique<Socket>(connection.release()),
+                              term, std::nullopt});
+            process(proposed);
+        }
+
+        void handle_client_read(Socket& connection,
+                                std::span<const std::byte> bytes) {
+            const auto decoded = dkv::decode_client_read_request(bytes);
+            const auto* request = std::get_if<dkv::ClientReadRequest>(&decoded);
+            if (!request) {
+                send_client_read_reply(connection.get(),
+                    {dkv::ClientReadStatus::InvalidRequest, node_->term(), 0, 0,
+                     std::nullopt});
+                return;
+            }
+            if (node_->role() != dkv::RaftRole::Leader) {
+                send_client_read_reply(connection.get(),
+                    {dkv::ClientReadStatus::NotLeader, node_->term(), 0,
+                     node_->known_leader().value_or(0), std::nullopt});
+                return;
+            }
+            if (pending_clients_.size() >= 1024) {
+                send_client_read_reply(connection.get(),
+                    {dkv::ClientReadStatus::Busy, node_->term(), 0, node_->id(),
+                     std::nullopt});
+                return;
+            }
+            const auto term = node_->term();
+            auto proposed = node_->read_barrier();
+            const auto* actions = std::get_if<dkv::RaftNodeActions>(&proposed);
+            if (!actions || !actions->proposed_index) {
+                const auto error = std::get_if<dkv::RaftNodeError>(&proposed);
+                const auto status = error && *error == dkv::RaftNodeError::NotLeader
+                    ? dkv::ClientReadStatus::NotLeader
+                    : dkv::ClientReadStatus::InternalError;
+                send_client_read_reply(connection.get(),
+                    {status, node_->term(), 0, node_->known_leader().value_or(0),
+                     std::nullopt});
+                if (error && status == dkv::ClientReadStatus::InternalError) {
+                    process(proposed);
+                }
+                return;
+            }
+            pending_clients_.emplace(*actions->proposed_index,
+                PendingClient{std::make_unique<Socket>(connection.release()),
+                              term, request->key});
             process(proposed);
         }
 
@@ -336,7 +415,11 @@ namespace {
             const auto bytes = receive_frame(connection.get());
             if (!bytes) return;
             if (bytes->size() >= 2 && (*bytes)[1] == std::byte{5}) {
-                handle_client(connection, *bytes);
+                handle_client_write(connection, *bytes);
+                return;
+            }
+            if (bytes->size() >= 2 && (*bytes)[1] == std::byte{7}) {
+                handle_client_read(connection, *bytes);
                 return;
             }
             const auto decoded = dkv::decode_raft_envelope(*bytes);
@@ -423,7 +506,7 @@ namespace {
         std::unique_ptr<dkv::RaftNode> node_;
         std::array<std::uint16_t, 3> ports_;
         int listener_;
-        std::map<std::uint64_t, PendingWrite> pending_writes_;
+        std::map<std::uint64_t, PendingClient> pending_clients_;
         std::mt19937 random_{std::random_device{}()};
         std::uniform_int_distribution<int> election_delay_{300, 600};
         Clock::time_point election_deadline_{};

@@ -48,11 +48,11 @@ namespace {
                 static_cast<std::byte>(length & 0xff)};
     }
 
-    int run(std::uint16_t port, const dkv::Command& command) {
-        const auto encoded = dkv::encode_client_request({command});
+    int run(std::uint16_t port, const dkv::EncodeClientResult& encoded,
+            bool reading) {
         const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
         if (!bytes) {
-            std::cerr << "invalid or oversized command\n";
+            std::cerr << "invalid or oversized request\n";
             return 2;
         }
         const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -77,7 +77,8 @@ namespace {
             !send_all(fd, bytes->data(), bytes->size()) ||
             !receive_all(fd, header.data(), header.size())) {
             ::close(fd);
-            std::cerr << "outcome unknown: connection closed or timed out\n";
+            std::cerr << (reading ? "read unavailable; retry\n"
+                                  : "outcome unknown: connection closed or timed out\n");
             return 4;
         }
         std::size_t length = 0;
@@ -93,8 +94,41 @@ namespace {
         const bool received = receive_all(fd, reply_bytes.data(), length);
         ::close(fd);
         if (!received) {
-            std::cerr << "outcome unknown: incomplete reply\n";
+            std::cerr << (reading ? "read unavailable; retry\n"
+                                  : "outcome unknown: incomplete reply\n");
             return 4;
+        }
+        if (reading) {
+            const auto decoded = dkv::decode_client_read_reply(reply_bytes);
+            const auto* reply = std::get_if<dkv::ClientReadReply>(&decoded);
+            if (!reply) {
+                std::cerr << "invalid server reply\n";
+                return 5;
+            }
+            switch (reply->status) {
+            case dkv::ClientReadStatus::Found:
+                std::cout << *reply->value << '\n';
+                return 0;
+            case dkv::ClientReadStatus::NotFound:
+                std::cout << "(not found)\n";
+                return 0;
+            case dkv::ClientReadStatus::NotLeader:
+                std::cout << "not leader";
+                if (reply->leader_hint != 0) {
+                    std::cout << "; try node " << reply->leader_hint;
+                }
+                std::cout << '\n';
+                return 3;
+            case dkv::ClientReadStatus::Busy:
+                std::cout << "leader busy; retry later\n";
+                return 5;
+            case dkv::ClientReadStatus::InvalidRequest:
+                std::cout << "invalid request\n";
+                return 2;
+            case dkv::ClientReadStatus::InternalError:
+                std::cout << "read unavailable; retry\n";
+                return 5;
+            }
         }
         const auto decoded = dkv::decode_client_reply(reply_bytes);
         const auto* reply = std::get_if<dkv::ClientWriteReply>(&decoded);
@@ -134,7 +168,7 @@ namespace {
 
 int main(int argc, char** argv) {
     if (argc != 4 && argc != 5) {
-        std::cerr << "usage: dkv_client PORT put KEY VALUE | delete KEY\n";
+        std::cerr << "usage: dkv_client PORT put KEY VALUE | delete KEY | get KEY\n";
         return 2;
     }
     unsigned port = 0;
@@ -150,12 +184,18 @@ int main(int argc, char** argv) {
     const std::string_view operation = argv[2];
     if (operation == "put" && argc == 5) {
         return run(static_cast<std::uint16_t>(port),
-                   {dkv::CommandType::Put, argv[3], argv[4]});
+                   dkv::encode_client_request(
+                       {{dkv::CommandType::Put, argv[3], argv[4]}}), false);
     }
     if (operation == "delete" && argc == 4) {
         return run(static_cast<std::uint16_t>(port),
-                   {dkv::CommandType::Delete, argv[3], ""});
+                   dkv::encode_client_request(
+                       {{dkv::CommandType::Delete, argv[3], ""}}), false);
     }
-    std::cerr << "usage: dkv_client PORT put KEY VALUE | delete KEY\n";
+    if (operation == "get" && argc == 4) {
+        return run(static_cast<std::uint16_t>(port),
+                   dkv::encode_client_read_request({argv[3]}), true);
+    }
+    std::cerr << "usage: dkv_client PORT put KEY VALUE | delete KEY | get KEY\n";
     return 2;
 }
