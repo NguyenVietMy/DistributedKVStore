@@ -1,3 +1,4 @@
+#include "dkv/client_wire.hpp"
 #include "dkv/raft_node.hpp"
 #include "dkv/raft_wire.hpp"
 
@@ -19,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <map>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -39,6 +41,7 @@ namespace {
         Socket(const Socket&) = delete;
         Socket& operator=(const Socket&) = delete;
         int get() const { return fd_; }
+        int release() { return std::exchange(fd_, -1); }
 
     private:
         int fd_;
@@ -84,7 +87,7 @@ namespace {
                 static_cast<std::byte>(size & 0xff)};
     }
 
-    std::optional<dkv::RaftEnvelope> receive_frame(int fd) {
+    std::optional<std::vector<std::byte>> receive_frame(int fd) {
         timeval timeout{0, 300000};
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         std::array<std::byte, 4> prefix{};
@@ -96,9 +99,18 @@ namespace {
         if (length == 0 || length > dkv::max_raft_frame_size) return std::nullopt;
         std::vector<std::byte> bytes(length);
         if (!read_all(fd, bytes.data(), bytes.size())) return std::nullopt;
-        const auto decoded = dkv::decode_raft_envelope(bytes);
-        if (const auto* message = std::get_if<dkv::RaftEnvelope>(&decoded)) return *message;
-        return std::nullopt;
+        return bytes;
+    }
+
+    bool send_client_reply(int fd, const dkv::ClientWriteReply& reply) {
+        const auto encoded = dkv::encode_client_reply(reply);
+        const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
+        if (!bytes) return false;
+        timeval timeout{0, 300000};
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        const auto prefix = length_prefix(bytes->size());
+        return write_all(fd, prefix.data(), prefix.size()) &&
+               write_all(fd, bytes->data(), bytes->size());
     }
 
     enum class SendResult { Sent, Unavailable, InvalidMessage };
@@ -169,7 +181,8 @@ namespace {
                 const int ready = ::poll(fds.data(), fds.size(), wait_ms);
                 if (ready < 0 && errno != EINTR) {
                     std::cerr << "poll failed\n";
-                    return 1;
+                    fatal_ = true;
+                    break;
                 }
                 if (ready > 0 && (fds[0].revents & POLLIN)) receive_one();
                 if (ready > 0 && (fds[1].revents & POLLIN)) read_console();
@@ -188,10 +201,16 @@ namespace {
                     reset_election_timer();
                 }
             }
+            fail_pending();
             return fatal_ ? 1 : 0;
         }
 
     private:
+        struct PendingWrite {
+            std::unique_ptr<Socket> connection;
+            std::uint64_t term;
+        };
+
         void reset_election_timer() {
             election_deadline_ = Clock::now() +
                 std::chrono::milliseconds(election_delay_(random_));
@@ -199,6 +218,7 @@ namespace {
 
         void process(const dkv::RaftNodeResult& result,
                      const std::optional<dkv::AppendEntries>& replied_to = std::nullopt) {
+            expire_pending();
             const auto* actions = std::get_if<dkv::RaftNodeActions>(&result);
             if (!actions) {
                 const auto error = std::get<dkv::RaftNodeError>(result);
@@ -207,6 +227,7 @@ namespace {
                     error == dkv::RaftNodeError::InconsistentState ||
                     error == dkv::RaftNodeError::TermExhausted ||
                     error == dkv::RaftNodeError::Stopped) {
+                    fail_pending();
                     fatal_ = true;
                     running_ = false;
                 }
@@ -219,6 +240,13 @@ namespace {
             }
             for (const auto& entry : actions->applied) {
                 std::cout << "applied index " << entry.index << std::endl;
+                const auto pending = pending_writes_.find(entry.index);
+                if (pending != pending_writes_.end()) {
+                    send_client_reply(pending->second.connection->get(),
+                        {dkv::ClientWriteStatus::Committed,
+                         pending->second.term, entry.index, node_->id()});
+                    pending_writes_.erase(pending);
+                }
             }
             for (const auto& outbound : actions->messages) {
                 const auto port = ports_[outbound.peer_id - 1];
@@ -229,6 +257,7 @@ namespace {
                     port, {node_->id(), outbound.message, correlation});
                 if (sent == SendResult::InvalidMessage) {
                     std::cerr << "could not encode Raft message\n";
+                    fail_pending();
                     fatal_ = true;
                     running_ = false;
                     return;
@@ -237,10 +266,81 @@ namespace {
             }
         }
 
+        void fail_pending() {
+            for (auto& [index, pending] : pending_writes_) {
+                send_client_reply(pending.connection->get(),
+                    {dkv::ClientWriteStatus::OutcomeUnknown,
+                     pending.term, index, node_->known_leader().value_or(0)});
+            }
+            pending_writes_.clear();
+        }
+
+        void expire_pending() {
+            for (auto it = pending_writes_.begin(); it != pending_writes_.end();) {
+                if (node_->role() == dkv::RaftRole::Leader &&
+                    it->second.term == node_->term()) {
+                    ++it;
+                    continue;
+                }
+                send_client_reply(it->second.connection->get(),
+                    {dkv::ClientWriteStatus::OutcomeUnknown, it->second.term,
+                     it->first, node_->known_leader().value_or(0)});
+                it = pending_writes_.erase(it);
+            }
+        }
+
+        void handle_client(Socket& connection, std::span<const std::byte> bytes) {
+            const auto decoded = dkv::decode_client_request(bytes);
+            const auto* request = std::get_if<dkv::ClientWriteRequest>(&decoded);
+            if (!request) {
+                send_client_reply(connection.get(),
+                    {dkv::ClientWriteStatus::InvalidRequest, node_->term(), 0, 0});
+                return;
+            }
+            if (node_->role() != dkv::RaftRole::Leader) {
+                send_client_reply(connection.get(),
+                    {dkv::ClientWriteStatus::NotLeader, node_->term(), 0,
+                     node_->known_leader().value_or(0)});
+                return;
+            }
+            if (pending_writes_.size() >= 1024) {
+                send_client_reply(connection.get(),
+                    {dkv::ClientWriteStatus::Busy, node_->term(), 0, node_->id()});
+                return;
+            }
+            const auto term = node_->term();
+            auto proposed = node_->propose(request->command);
+            const auto* actions = std::get_if<dkv::RaftNodeActions>(&proposed);
+            if (!actions || !actions->proposed_index) {
+                const auto error = std::get_if<dkv::RaftNodeError>(&proposed);
+                const auto status = error && *error == dkv::RaftNodeError::NotLeader
+                    ? dkv::ClientWriteStatus::NotLeader
+                    : error && *error == dkv::RaftNodeError::InvalidCommand
+                        ? dkv::ClientWriteStatus::InvalidRequest
+                        : dkv::ClientWriteStatus::InternalError;
+                send_client_reply(connection.get(),
+                    {status, node_->term(), 0, node_->known_leader().value_or(0)});
+                if (error && status == dkv::ClientWriteStatus::InternalError) {
+                    process(proposed);
+                }
+                return;
+            }
+            pending_writes_.emplace(*actions->proposed_index,
+                PendingWrite{std::make_unique<Socket>(connection.release()), term});
+            process(proposed);
+        }
+
         void receive_one() {
             Socket connection{::accept(listener_, nullptr, nullptr)};
             if (connection.get() < 0) return;
-            const auto envelope = receive_frame(connection.get());
+            const auto bytes = receive_frame(connection.get());
+            if (!bytes) return;
+            if (bytes->size() >= 2 && (*bytes)[1] == std::byte{5}) {
+                handle_client(connection, *bytes);
+                return;
+            }
+            const auto decoded = dkv::decode_raft_envelope(*bytes);
+            const auto* envelope = std::get_if<dkv::RaftEnvelope>(&decoded);
             if (!envelope) return;
             const auto sender = envelope->sender_id;
             if (sender < 1 || sender > 3 || sender == node_->id()) return;
@@ -323,6 +423,7 @@ namespace {
         std::unique_ptr<dkv::RaftNode> node_;
         std::array<std::uint16_t, 3> ports_;
         int listener_;
+        std::map<std::uint64_t, PendingWrite> pending_writes_;
         std::mt19937 random_{std::random_device{}()};
         std::uniform_int_distribution<int> election_delay_{300, 600};
         Clock::time_point election_deadline_{};
