@@ -44,6 +44,8 @@ namespace dkv {
         [[nodiscard]] ElectionStartResult start_election();
         [[nodiscard]] VoteReplyOutcome handle_vote_reply(
             std::uint64_t peer_id, const RequestVoteReply& reply);
+        // Called after a known peer's AppendEntries term has been accepted.
+        void observe_leader(std::uint64_t term) noexcept;
         [[nodiscard]] RaftRole role() const noexcept;
         [[nodiscard]] unsigned granted_votes() const noexcept;
         [[nodiscard]] std::uint64_t self_id() const noexcept;

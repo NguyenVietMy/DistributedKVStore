@@ -38,6 +38,12 @@ namespace dkv {
         return peer_ids_;
     }
 
+    void RaftElection::observe_leader(std::uint64_t term) noexcept {
+        if (term != 0 && term == metadata_.state().current_term) {
+            become_follower();
+        }
+    }
+
     void RaftElection::become_follower() noexcept {
         role_ = RaftRole::Follower;
         election_term_ = 0;
