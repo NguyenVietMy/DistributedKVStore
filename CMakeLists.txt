@@ -16,11 +16,17 @@ add_library(dkv_core
     src/raft_leader.cpp
     src/raft_apply.cpp
     src/raft_node.cpp
+    src/raft_wire.cpp
 )
 
 target_include_directories(dkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_compile_features(dkv_core PUBLIC cxx_std_20)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(dkv_node src/raft_server.cpp)
+    target_link_libraries(dkv_node PRIVATE dkv_core)
+endif()
 
 include(CTest)
 
@@ -69,6 +75,10 @@ if(BUILD_TESTING)
     target_link_libraries(raft_node_test PRIVATE dkv_core)
     add_test(NAME raft_node_test COMMAND raft_node_test)
 
+    add_executable(raft_wire_test tests/raft_wire_test.cpp)
+    target_link_libraries(raft_wire_test PRIVATE dkv_core)
+    add_test(NAME raft_wire_test COMMAND raft_wire_test)
+
     add_executable(raft_vote_test tests/raft_vote_test.cpp)
     target_link_libraries(raft_vote_test PRIVATE dkv_core)
     add_test(NAME raft_vote_test COMMAND raft_vote_test)
@@ -106,6 +116,14 @@ if(BUILD_TESTING)
             "LINKER:--wrap=pwrite"
         )
         add_test(NAME persistent_log_truncate_test COMMAND persistent_log_truncate_test)
+
+        find_package(Python3 COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME raft_server_test
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/raft_server_test.py
+                    $<TARGET_FILE:dkv_node>)
+        endif()
     endif()
 
 endif()

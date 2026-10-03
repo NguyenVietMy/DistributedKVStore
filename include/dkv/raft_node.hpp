@@ -93,6 +93,7 @@ namespace dkv {
         [[nodiscard]] std::uint64_t commit_index() const noexcept;
         [[nodiscard]] std::uint64_t last_applied() const noexcept;
         [[nodiscard]] std::optional<std::uint64_t> known_leader() const noexcept;
+        // Local applied state inspection; this is not a linearizable client read.
         [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
 
         RaftNode(const RaftNode&) = delete;

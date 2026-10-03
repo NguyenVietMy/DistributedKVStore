@@ -67,7 +67,8 @@ namespace dkv {
 
     bool RaftNode::queue_append(std::uint64_t peer_id, RaftNodeActions& actions) {
         if (!leader_) return false;
-        auto result = leader_->make_request(peer_id);
+        // Keep socket frames bounded even when the log has a long backlog.
+        auto result = leader_->make_request(peer_id, 4);
         const auto* request = std::get_if<AppendEntries>(&result);
         if (!request) return false;
         actions.messages.push_back({peer_id, *request});
@@ -138,7 +139,7 @@ namespace dkv {
         }
         const auto reply = std::get<RequestVoteReply>(result);
         RaftNodeActions actions;
-        actions.reset_election_timer = reply.vote_granted;
+        actions.reset_election_timer = term() > old_term || reply.vote_granted;
         actions.messages.push_back({peer_id, reply});
         return actions;
     }

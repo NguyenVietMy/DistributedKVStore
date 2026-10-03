@@ -299,6 +299,21 @@ namespace {
                    (*node)->last_index() == 1,
                "higher term or durable no-op was lost on restart");
     }
+
+    void test_higher_term_vote_request_resets_timer_even_when_denied() {
+        ElectedCluster cluster;
+        const auto elected = cluster.elect_a();
+        if (!elected) return;
+        const auto denied = cluster.a.node->on_request_vote(2, {2, 2, 0, 0});
+        const auto* denied_actions =
+            actions(denied, "A did not process higher-term vote request");
+        if (!denied_actions) return;
+        const auto reply = message_to<dkv::RequestVoteReply>(*denied_actions, 2);
+        expect(reply && !reply->vote_granted && reply->term == 2 &&
+                   cluster.a.node->role() == dkv::RaftRole::Follower &&
+                   denied_actions->reset_election_timer,
+               "higher-term rejection did not step down and reset election timer");
+    }
 }
 
 int main() {
@@ -306,6 +321,7 @@ int main() {
     test_same_term_candidate_steps_down_for_leader();
     test_client_write_applies_only_after_majority_ack();
     test_higher_term_reply_steps_down_and_persists_term();
+    test_higher_term_vote_request_resets_timer_even_when_denied();
     if (failures != 0) std::cerr << failures << " Raft node tests failed\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
