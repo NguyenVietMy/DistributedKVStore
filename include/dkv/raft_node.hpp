@@ -98,6 +98,8 @@ namespace dkv {
         [[nodiscard]] std::optional<std::uint64_t> known_leader() const noexcept;
         // Local applied state inspection; this is not a linearizable client read.
         [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
+        // Results are reconstructed by applying committed log entries after restart.
+        [[nodiscard]] const AppliedRequest* request_result(const RequestId& id) const;
 
         RaftNode(const RaftNode&) = delete;
         RaftNode& operator=(const RaftNode&) = delete;

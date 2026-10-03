@@ -253,7 +253,7 @@ namespace {
 
     void test_wrong_format_version(){
         const std::vector<std::byte> bytes{
-            std::byte{0x02}, std::byte{0x03},
+            std::byte{0x03}, std::byte{0x03},
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, 
             std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}
         };
@@ -342,6 +342,35 @@ namespace {
             "invalid NoOp did not report InvalidCommand"
         );
     }
+
+    void test_request_id_encoding() {
+        dkv::RequestId id;
+        for (std::size_t i = 0; i < id.bytes.size(); ++i) {
+            id.bytes[i] = static_cast<std::uint8_t>(i + 1);
+        }
+        const dkv::Command command{dkv::CommandType::Put, "a", "bc", id};
+        const auto encoded = dkv::encode_command(command);
+        const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
+        expect(bytes != nullptr, "request-ID command could not be encoded");
+        if (!bytes) return;
+        expect(bytes->size() == 29 && (*bytes)[0] == std::byte{2},
+               "request-ID command did not use version 2");
+        expect(dkv::decode_command(*bytes) == dkv::DecodeCommandResult{command},
+               "request ID did not survive command round trip");
+        auto truncated = *bytes;
+        truncated.resize(25);
+        expect_decode_error(truncated, dkv::CommandCodecError::InputTooShort,
+                            "truncated request ID was accepted");
+        const dkv::Command invalid_noop{dkv::CommandType::NoOp, "", "", id};
+        expect_invalid_command(invalid_noop, "no-op with request ID was accepted");
+        auto malformed = *bytes;
+        malformed[1] = std::byte{3};
+        malformed[2] = malformed[3] = malformed[4] = malformed[5] = std::byte{0};
+        malformed[6] = malformed[7] = malformed[8] = malformed[9] = std::byte{0};
+        malformed.resize(26);
+        expect_decode_error(malformed, dkv::CommandCodecError::InvalidCommand,
+                            "version 2 no-op with request ID was accepted");
+    }
 }
 
 int main(){
@@ -360,6 +389,7 @@ int main(){
     test_embedded_null_bytes();
     test_put_decoding();
     test_delete_decoding();
+    test_request_id_encoding();
     if(failures != 0){
         std::cerr << failures << " test check(s) failed\n";
         return 1;

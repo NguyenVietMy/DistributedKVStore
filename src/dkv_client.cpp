@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -13,12 +14,56 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
 
 namespace {
+    int hex_digit(char character) {
+        if (character >= '0' && character <= '9') return character - '0';
+        if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+        if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+        return -1;
+    }
+
+    std::optional<dkv::RequestId> parse_request_id(std::string_view text) {
+        if (text.size() != 32) return std::nullopt;
+        dkv::RequestId id;
+        for (std::size_t i = 0; i < id.bytes.size(); ++i) {
+            const int high = hex_digit(text[2 * i]);
+            const int low = hex_digit(text[2 * i + 1]);
+            if (high < 0 || low < 0) return std::nullopt;
+            id.bytes[i] = static_cast<std::uint8_t>((high << 4) | low);
+        }
+        return id;
+    }
+
+    std::optional<dkv::RequestId> generate_request_id() {
+        dkv::RequestId id;
+        std::size_t filled = 0;
+        while (filled < id.bytes.size()) {
+            const auto count = ::getrandom(id.bytes.data() + filled,
+                                           id.bytes.size() - filled, 0);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) return std::nullopt;
+            filled += static_cast<std::size_t>(count);
+        }
+        return id;
+    }
+
+    std::string format_request_id(const dkv::RequestId& id) {
+        constexpr char digits[] = "0123456789abcdef";
+        std::string text;
+        text.reserve(32);
+        for (const auto octet : id.bytes) {
+            text.push_back(digits[octet >> 4]);
+            text.push_back(digits[octet & 0x0f]);
+        }
+        return text;
+    }
+
     bool send_all(int fd, const std::byte* data, std::size_t size) {
         std::size_t done = 0;
         while (done < size) {
@@ -167,8 +212,11 @@ namespace {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4 && argc != 5) {
-        std::cerr << "usage: dkv_client PORT put KEY VALUE | delete KEY | get KEY\n";
+    constexpr const char* usage =
+        "usage: dkv_client PORT put KEY VALUE [REQUEST_ID] | "
+        "delete KEY [REQUEST_ID] | get KEY\n";
+    if (argc < 4 || argc > 6) {
+        std::cerr << usage;
         return 2;
     }
     unsigned port = 0;
@@ -182,20 +230,28 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string_view operation = argv[2];
-    if (operation == "put" && argc == 5) {
+    if ((operation == "put" && (argc == 5 || argc == 6)) ||
+        (operation == "delete" && (argc == 4 || argc == 5))) {
+        const bool explicit_id = (operation == "put" && argc == 6) ||
+                                 (operation == "delete" && argc == 5);
+        const auto id = explicit_id
+            ? parse_request_id(argv[argc - 1]) : generate_request_id();
+        if (!id) {
+            std::cerr << (explicit_id ? "invalid request ID (expected 32 hex digits)\n"
+                                      : "could not generate request ID\n");
+            return 2;
+        }
+        std::cerr << "request id " << format_request_id(*id) << '\n';
+        const dkv::Command command{
+            operation == "put" ? dkv::CommandType::Put : dkv::CommandType::Delete,
+            argv[3], operation == "put" ? argv[4] : "", id};
         return run(static_cast<std::uint16_t>(port),
-                   dkv::encode_client_request(
-                       {{dkv::CommandType::Put, argv[3], argv[4]}}), false);
-    }
-    if (operation == "delete" && argc == 4) {
-        return run(static_cast<std::uint16_t>(port),
-                   dkv::encode_client_request(
-                       {{dkv::CommandType::Delete, argv[3], ""}}), false);
+                   dkv::encode_client_request({command}), false);
     }
     if (operation == "get" && argc == 4) {
         return run(static_cast<std::uint16_t>(port),
                    dkv::encode_client_read_request({argv[3]}), true);
     }
-    std::cerr << "usage: dkv_client PORT put KEY VALUE | delete KEY | get KEY\n";
+    std::cerr << usage;
     return 2;
 }

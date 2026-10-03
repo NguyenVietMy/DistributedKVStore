@@ -96,10 +96,53 @@ namespace {
         expect(results && results->size() == 4 && recovered.get("x") == "20",
                "committed log did not rebuild a fresh state machine");
     }
+
+    void test_request_results_replay_from_log() {
+        TempDirectory dir;
+        expect(!dir.path().empty(), "could not create replay test directory");
+        if (dir.path().empty()) return;
+        dkv::RequestId id;
+        id.bytes[0] = 0xa5;
+        const dkv::Command first{dkv::CommandType::Put, "x", "old", id};
+        const dkv::Command later{dkv::CommandType::Put, "x", "new"};
+        const dkv::Command conflict{dkv::CommandType::Put, "x", "wrong", id};
+        {
+            auto opened = dkv::PersistentLog::open(dir.path() / "raft.log");
+            auto* log = std::get_if<std::unique_ptr<dkv::PersistentLog>>(&opened);
+            expect(log && *log, "could not open request replay log");
+            if (!log || !*log) return;
+            expect((*log)->append({1, 2, first}) ==
+                   dkv::PersistentLogAppendResult::Appended, "could not append first request");
+            expect((*log)->append({2, 2, later}) ==
+                   dkv::PersistentLogAppendResult::Appended, "could not append later write");
+            expect((*log)->append({3, 3, first}) ==
+                   dkv::PersistentLogAppendResult::Appended, "could not append retry");
+            expect((*log)->append({4, 3, conflict}) ==
+                   dkv::PersistentLogAppendResult::Appended, "could not append conflict");
+        }
+        auto reopened = dkv::PersistentLog::open(dir.path() / "raft.log");
+        auto* log = std::get_if<std::unique_ptr<dkv::PersistentLog>>(&reopened);
+        expect(log && *log, "could not reopen request replay log");
+        if (!log || !*log) return;
+        dkv::KvStateMachine recovered;
+        const auto applied = dkv::apply_committed(**log, recovered, 4);
+        expect(applied == dkv::ApplyCommittedResult{
+                    std::vector<dkv::AppliedLogEntry>{
+                        {1, dkv::ApplyResult::Applied},
+                        {2, dkv::ApplyResult::Applied},
+                        {3, dkv::ApplyResult::Applied},
+                        {4, dkv::ApplyResult::RequestConflict}}},
+               "replayed retry or conflict had the wrong result");
+        const auto* prior = recovered.request_result(id);
+        expect(prior && prior->index == 1 && prior->term == 2 &&
+                   prior->command == first && recovered.get("x") == "new",
+               "replay did not preserve original request result and state");
+    }
 }
 
 int main() {
     test_committed_prefix_and_replay();
+    test_request_results_replay_from_log();
     if (failures != 0) {
         std::cerr << failures << " test check(s) failed\n";
         return 1;

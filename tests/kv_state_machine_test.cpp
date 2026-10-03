@@ -171,6 +171,35 @@ namespace {
         expect(!state.get(binary_key).has_value(), "Delete should remove the complete binary key");
     }
 
+    void test_request_deduplication() {
+        dkv::KvStateMachine state;
+        dkv::RequestId id;
+        id.bytes[0] = 7;
+        const dkv::Command first{dkv::CommandType::Put, "x", "old", id};
+        const dkv::Command later{dkv::CommandType::Put, "x", "new"};
+        expect(state.apply(1, first) == dkv::ApplyResult::Applied,
+               "first request did not apply");
+        expect(state.apply(2, later) == dkv::ApplyResult::Applied,
+               "intervening write did not apply");
+        expect(state.apply(3, first) == dkv::ApplyResult::Applied &&
+               state.get("x") == "new" && state.last_applied() == 3,
+               "retry applied a write twice");
+        const auto* prior = state.request_result(id);
+        expect(prior && prior->index == 1 && prior->command == first,
+               "first request result was not retained");
+        const dkv::Command conflict{dkv::CommandType::Put, "x", "wrong", id};
+        expect(state.apply(4, conflict) == dkv::ApplyResult::RequestConflict &&
+               state.get("x") == "new" && state.last_applied() == 4,
+               "reused request ID changed state");
+
+        dkv::RequestId delete_id;
+        delete_id.bytes[0] = 8;
+        const dkv::Command missing_delete{dkv::CommandType::Delete, "missing", "", delete_id};
+        expect(state.apply(5, missing_delete) == dkv::ApplyResult::KeyNotFound &&
+               state.apply(6, missing_delete) == dkv::ApplyResult::KeyNotFound,
+               "retry of missing-key deletion changed its result");
+    }
+
 }  // namespace
 
 int main() {
@@ -178,6 +207,7 @@ int main() {
     test_put_and_log_ordering();
     test_delete();
     test_no_op();
+    test_request_deduplication();
     test_invalid_commands();
     test_arbitrary_byte_strings();
 

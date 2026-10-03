@@ -218,9 +218,10 @@ namespace {
 
     private:
         struct PendingClient {
-            std::unique_ptr<Socket> connection;
+            std::vector<std::unique_ptr<Socket>> connections;
             std::uint64_t term;
             std::optional<std::string> read_key;
+            std::optional<dkv::Command> write_command;
         };
 
         void reset_election_timer() {
@@ -256,14 +257,23 @@ namespace {
                 if (pending != pending_clients_.end()) {
                     if (pending->second.read_key) {
                         const auto value = node_->get(*pending->second.read_key);
-                        send_client_read_reply(pending->second.connection->get(),
-                            {value ? dkv::ClientReadStatus::Found
-                                   : dkv::ClientReadStatus::NotFound,
-                             pending->second.term, entry.index, node_->id(), value});
+                        for (const auto& connection : pending->second.connections) {
+                            send_client_read_reply(connection->get(),
+                                {value ? dkv::ClientReadStatus::Found
+                                       : dkv::ClientReadStatus::NotFound,
+                                 pending->second.term, entry.index, node_->id(), value});
+                        }
                     } else {
-                        send_client_reply(pending->second.connection->get(),
-                            {dkv::ClientWriteStatus::Committed,
-                             pending->second.term, entry.index, node_->id()});
+                        const auto& command = *pending->second.write_command;
+                        const auto* prior = node_->request_result(*command.request_id);
+                        const bool same_request = prior && prior->command == command;
+                        for (const auto& connection : pending->second.connections) {
+                            send_client_reply(connection->get(),
+                                {same_request ? dkv::ClientWriteStatus::Committed
+                                              : dkv::ClientWriteStatus::InvalidRequest,
+                                 same_request ? prior->term : node_->term(),
+                                 same_request ? prior->index : 0, node_->id()});
+                        }
                     }
                     pending_clients_.erase(pending);
                 }
@@ -288,15 +298,17 @@ namespace {
 
         void fail_pending() {
             for (auto& [index, pending] : pending_clients_) {
-                if (pending.read_key) {
-                    send_client_read_reply(pending.connection->get(),
-                        {dkv::ClientReadStatus::InternalError,
-                         pending.term, index, node_->known_leader().value_or(0),
-                         std::nullopt});
-                } else {
-                    send_client_reply(pending.connection->get(),
-                        {dkv::ClientWriteStatus::OutcomeUnknown,
-                         pending.term, index, node_->known_leader().value_or(0)});
+                for (const auto& connection : pending.connections) {
+                    if (pending.read_key) {
+                        send_client_read_reply(connection->get(),
+                            {dkv::ClientReadStatus::InternalError,
+                             pending.term, index, node_->known_leader().value_or(0),
+                             std::nullopt});
+                    } else {
+                        send_client_reply(connection->get(),
+                            {dkv::ClientWriteStatus::OutcomeUnknown,
+                             pending.term, index, node_->known_leader().value_or(0)});
+                    }
                 }
             }
             pending_clients_.clear();
@@ -309,14 +321,16 @@ namespace {
                     ++it;
                     continue;
                 }
-                if (it->second.read_key) {
-                    send_client_read_reply(it->second.connection->get(),
-                        {dkv::ClientReadStatus::NotLeader, node_->term(), 0,
-                         node_->known_leader().value_or(0), std::nullopt});
-                } else {
-                    send_client_reply(it->second.connection->get(),
-                        {dkv::ClientWriteStatus::OutcomeUnknown, it->second.term,
-                         it->first, node_->known_leader().value_or(0)});
+                for (const auto& connection : it->second.connections) {
+                    if (it->second.read_key) {
+                        send_client_read_reply(connection->get(),
+                            {dkv::ClientReadStatus::NotLeader, node_->term(), 0,
+                             node_->known_leader().value_or(0), std::nullopt});
+                    } else {
+                        send_client_reply(connection->get(),
+                            {dkv::ClientWriteStatus::OutcomeUnknown, it->second.term,
+                             it->first, node_->known_leader().value_or(0)});
+                    }
                 }
                 it = pending_clients_.erase(it);
             }
@@ -335,6 +349,33 @@ namespace {
                 send_client_reply(connection.get(),
                     {dkv::ClientWriteStatus::NotLeader, node_->term(), 0,
                      node_->known_leader().value_or(0)});
+                return;
+            }
+            if (const auto* prior = node_->request_result(*request->command.request_id)) {
+                const bool same_request = prior->command == request->command;
+                send_client_reply(connection.get(),
+                    {same_request ? dkv::ClientWriteStatus::Committed
+                                  : dkv::ClientWriteStatus::InvalidRequest,
+                     same_request ? prior->term : node_->term(),
+                     same_request ? prior->index : 0, node_->id()});
+                return;
+            }
+            for (auto& [index, pending] : pending_clients_) {
+                if (!pending.write_command ||
+                    pending.write_command->request_id != request->command.request_id) {
+                    continue;
+                }
+                if (*pending.write_command != request->command) {
+                    send_client_reply(connection.get(),
+                        {dkv::ClientWriteStatus::InvalidRequest,
+                         node_->term(), 0, node_->id()});
+                } else if (pending.connections.size() >= 1024) {
+                    send_client_reply(connection.get(),
+                        {dkv::ClientWriteStatus::Busy, node_->term(), 0, node_->id()});
+                } else {
+                    pending.connections.emplace_back(
+                        std::make_unique<Socket>(connection.release()));
+                }
                 return;
             }
             if (pending_clients_.size() >= 1024) {
@@ -359,9 +400,10 @@ namespace {
                 }
                 return;
             }
-            pending_clients_.emplace(*actions->proposed_index,
-                PendingClient{std::make_unique<Socket>(connection.release()),
-                              term, std::nullopt});
+            PendingClient pending{{}, term, std::nullopt, request->command};
+            pending.connections.emplace_back(
+                std::make_unique<Socket>(connection.release()));
+            pending_clients_.emplace(*actions->proposed_index, std::move(pending));
             process(proposed);
         }
 
@@ -403,9 +445,10 @@ namespace {
                 }
                 return;
             }
-            pending_clients_.emplace(*actions->proposed_index,
-                PendingClient{std::make_unique<Socket>(connection.release()),
-                              term, request->key});
+            PendingClient pending{{}, term, request->key, std::nullopt};
+            pending.connections.emplace_back(
+                std::make_unique<Socket>(connection.release()));
+            pending_clients_.emplace(*actions->proposed_index, std::move(pending));
             process(proposed);
         }
 

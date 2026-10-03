@@ -57,7 +57,8 @@ namespace dkv {
     }
 
     EncodeClientResult encode_client_request(const ClientWriteRequest& request) {
-        if (request.command.type == CommandType::NoOp) {
+        if (request.command.type == CommandType::NoOp ||
+            !request.command.request_id) {
             return ClientWireError::InvalidMessage;
         }
         auto encoded = encode_command(request.command);
@@ -79,7 +80,8 @@ namespace dkv {
         if (bytes[1] != request_kind) return ClientWireError::InvalidMessage;
         const auto decoded = decode_command(bytes.subspan(2));
         const auto* command = std::get_if<Command>(&decoded);
-        if (!command || command->type == CommandType::NoOp) {
+        if (!command || command->type == CommandType::NoOp ||
+            !command->request_id) {
             return ClientWireError::InvalidMessage;
         }
         return ClientWriteRequest{*command};

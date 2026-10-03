@@ -53,6 +53,9 @@ namespace dkv {
     std::optional<std::string> RaftNode::get(const std::string& key) const {
         return state_.get(key);
     }
+    const AppliedRequest* RaftNode::request_result(const RequestId& id) const {
+        return state_.request_result(id);
+    }
 
     bool RaftNode::is_peer(std::uint64_t peer_id) const noexcept {
         return peer_id == peer_ids_[0] || peer_id == peer_ids_[1];

@@ -22,7 +22,7 @@ namespace dkv {
             const auto index = state.last_applied() + 1;
             const auto entry = log.entry_at(index);
             if (!entry) return ApplyCommittedError::MissingEntry;
-            const auto result = state.apply(index, entry->command);
+            const auto result = state.apply(index, entry->command, entry->term);
             if (result == ApplyResult::InvalidCommand) {
                 return ApplyCommittedError::InvalidCommand;
             }

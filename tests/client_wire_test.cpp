@@ -17,9 +17,11 @@ namespace {
     }
 
     void test_requests() {
+        dkv::RequestId id;
+        id.bytes[0] = 0x42;
         for (const auto& command : {
-                 dkv::Command{dkv::CommandType::Put, "x", "10"},
-                 dkv::Command{dkv::CommandType::Delete, "x", ""}}) {
+                 dkv::Command{dkv::CommandType::Put, "x", "10", id},
+                 dkv::Command{dkv::CommandType::Delete, "x", "", id}}) {
             const dkv::ClientWriteRequest request{command};
             const auto encoded = dkv::encode_client_request(request);
             const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
@@ -38,6 +40,10 @@ namespace {
                    {{dkv::CommandType::NoOp, "", ""}}) ==
                    dkv::EncodeClientResult{dkv::ClientWireError::InvalidMessage},
                "client no-op was accepted");
+        expect(dkv::encode_client_request(
+                   {{dkv::CommandType::Put, "x", "10"}}) ==
+                   dkv::EncodeClientResult{dkv::ClientWireError::InvalidMessage},
+               "write without request ID was accepted");
     }
 
     void test_replies() {

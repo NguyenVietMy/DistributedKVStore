@@ -4,6 +4,7 @@ import os
 import re
 import selectors
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -111,8 +112,15 @@ def main(server_binary, client_binary):
             for node_id in (1, 2, 3):
                 start(node_id)
             old_leader = elected_leader({1, 2, 3})
-            committed = client(old_leader, "put", "x", "old")
-            assert committed.returncode == 0 and "index 2" in committed.stdout, committed
+            # Drop the connection immediately after sending a write. The client
+            # never receives the commit reply, but retains the request ID.
+            original_id = "00112233445566778899aabbccddeeff"
+            key, value = b"x", b"old"
+            command = struct.pack(">BBII", 2, 1, len(key), len(value))
+            command += bytes.fromhex(original_id) + key + value
+            request = bytes((1, 5)) + command
+            with socket.create_connection(("127.0.0.1", ports[old_leader - 1]), 2) as sock:
+                sock.sendall(struct.pack(">I", len(request)) + request)
             collect_until(lambda: all("applied index 2" in lines[i] for i in active))
 
             survivors = {1, 2, 3} - {old_leader}
@@ -145,6 +153,18 @@ def main(server_binary, client_binary):
             new_value = client(new_leader, "put", "x", "new")
             assert new_value.returncode == 0, new_value
             index = int(re.search(r"index (\d+)", new_value.stdout).group(1))
+            retried = client(new_leader, "put", "x", "old", original_id)
+            assert retried.returncode == 0 and "index 2" in retried.stdout, retried
+            conflicting = client(new_leader, "put", "x", "wrong", original_id)
+            assert conflicting.returncode == 2 and "invalid request" in conflicting.stdout, conflicting
+            before_status = len(lines[new_leader])
+            console(new_leader, "status")
+            collect_until(lambda: any("role leader" in line
+                                      for line in lines[new_leader][before_status:]))
+            assert any(f" log {index} " in line
+                       for line in lines[new_leader][before_status:]), lines
+            still_new = client(new_leader, "get", "x")
+            assert still_new.returncode == 0 and still_new.stdout == "new\n", still_new
 
             start(old_leader)
             collect_until(lambda: f"applied index {index}" in lines[old_leader])
@@ -164,6 +184,12 @@ def main(server_binary, client_binary):
             assert recovered.returncode == 0 and recovered.stdout == "new\n", recovered
             no_ghost = client(restarted_leader, "get", "ghost")
             assert no_ghost.returncode == 0 and no_ghost.stdout == "(not found)\n", no_ghost
+            retried_after_restart = client(
+                restarted_leader, "put", "x", "old", original_id)
+            assert retried_after_restart.returncode == 0 and (
+                retried_after_restart.stdout == retried.stdout), retried_after_restart
+            unchanged = client(restarted_leader, "get", "x")
+            assert unchanged.returncode == 0 and unchanged.stdout == "new\n", unchanged
         finally:
             for node_id in list(active):
                 process = processes[node_id]
