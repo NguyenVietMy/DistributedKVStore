@@ -12,6 +12,12 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+`raft_simulation_test` drives three nodes with logical time and a seeded message
+queue. It tests a partition, a new leader, crash/restart, and conflicting-log
+repair while checking committed-history and application invariants after each
+event. A failure prints its seed; replay it with
+`./build/raft_simulation_test SEED`.
+
 Run three nodes in separate terminals, using distinct data directories:
 
 ```sh

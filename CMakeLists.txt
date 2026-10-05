@@ -78,6 +78,10 @@ if(BUILD_TESTING)
     target_link_libraries(raft_node_test PRIVATE dkv_core)
     add_test(NAME raft_node_test COMMAND raft_node_test)
 
+    add_executable(raft_simulation_test tests/raft_simulation_test.cpp)
+    target_link_libraries(raft_simulation_test PRIVATE dkv_core)
+    add_test(NAME raft_simulation_test COMMAND raft_simulation_test)
+
     add_executable(raft_wire_test tests/raft_wire_test.cpp)
     target_link_libraries(raft_wire_test PRIVATE dkv_core)
     add_test(NAME raft_wire_test COMMAND raft_wire_test)
