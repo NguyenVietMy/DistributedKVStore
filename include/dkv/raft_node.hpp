@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,10 +29,19 @@ namespace dkv {
         bool operator==(const OutboundRaftMessage&) const = default;
     };
 
+    struct ReadyRead {
+        std::uint64_t id{0};
+        std::uint64_t index{0};
+
+        bool operator==(const ReadyRead&) const = default;
+    };
+
     struct RaftNodeActions {
         std::vector<OutboundRaftMessage> messages;
         std::vector<AppliedLogEntry> applied;
+        std::vector<ReadyRead> ready_reads;
         std::optional<std::uint64_t> proposed_index;
+        std::optional<std::uint64_t> started_read_id;
         bool reset_election_timer{false};
         bool schedule_heartbeat{false};
     };
@@ -85,8 +95,9 @@ namespace dkv {
         // Proposes a PUT or DELETE. Completion belongs to the caller after
         // the returned index appears in applied; this call is not an ACK.
         [[nodiscard]] RaftNodeResult propose(const Command& command);
-        // Appends a current-term no-op. A read may use the local state only
-        // after this index appears in applied while leadership is unchanged.
+        // Confirms leadership with a fresh quorum heartbeat after a current-term
+        // entry commits. The caller may read local state when ready_reads reports
+        // the returned started_read_id, provided leadership has not changed.
         [[nodiscard]] RaftNodeResult read_barrier();
 
         [[nodiscard]] std::uint64_t id() const noexcept;
@@ -115,6 +126,9 @@ namespace dkv {
         [[nodiscard]] bool is_peer(std::uint64_t peer_id) const noexcept;
         [[nodiscard]] bool queue_append(std::uint64_t peer_id, RaftNodeActions& actions);
         [[nodiscard]] bool apply_ready(RaftNodeActions& actions);
+        [[nodiscard]] bool current_term_committed() const;
+        void start_waiting_reads(RaftNodeActions& actions);
+        void drop_leadership();
         [[nodiscard]] RaftNodeResult append_as_leader(const Command& command);
         [[nodiscard]] RaftNodeResult stop(RaftNodeError error);
 
@@ -126,6 +140,8 @@ namespace dkv {
         KvStateMachine state_;
         RaftElection election_;
         std::unique_ptr<RaftLeaderReplication> leader_;
+        std::map<std::uint64_t, std::optional<AppendEntries>> read_rounds_;
+        std::uint64_t next_read_id_{1};
         std::optional<std::uint64_t> known_leader_;
         bool stopped_{false};
     };

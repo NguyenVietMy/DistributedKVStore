@@ -64,6 +64,7 @@ namespace dkv {
             put_u64(out, request.prev_log_index);
             put_u64(out, request.prev_log_term);
             put_u64(out, request.leader_commit);
+            put_u64(out, request.read_context);
             put_u32(out, static_cast<std::uint32_t>(request.entries.size()));
             for (const auto& entry : request.entries) {
                 const auto encoded = encode_log_entry(entry);
@@ -83,7 +84,8 @@ namespace dkv {
             if (!reader.u64(request.term) || !reader.u64(request.leader_id) ||
                 !reader.u64(request.prev_log_index) ||
                 !reader.u64(request.prev_log_term) ||
-                !reader.u64(request.leader_commit) || !reader.u32(count)) {
+                !reader.u64(request.leader_commit) ||
+                !reader.u64(request.read_context) || !reader.u32(count)) {
                 return false;
             }
             // Each record needs at least a four-byte length prefix.
@@ -112,7 +114,7 @@ namespace dkv {
             return RaftWireError::InvalidEnvelope;
         }
         std::vector<std::byte> out;
-        put_u8(out, 1); // wire version
+        put_u8(out, 2); // wire version
         put_u8(out, static_cast<std::uint8_t>(envelope.message.index() + 1));
         put_u64(out, envelope.sender_id);
         if (const auto* value = std::get_if<RequestVote>(&envelope.message)) {
@@ -146,7 +148,7 @@ namespace dkv {
         if (!reader.u8(version) || !reader.u8(kind) || !reader.u64(sender)) {
             return RaftWireError::Truncated;
         }
-        if (version != 1) return RaftWireError::UnsupportedVersion;
+        if (version != 2) return RaftWireError::UnsupportedVersion;
         if (sender == 0) return RaftWireError::InvalidEnvelope;
         RaftEnvelope envelope;
         envelope.sender_id = sender;

@@ -72,6 +72,20 @@ namespace {
         return std::nullopt;
     }
 
+    std::optional<dkv::AppendEntries> read_probe_to(
+        const dkv::RaftNodeActions& actions, std::uint64_t peer_id,
+        std::uint64_t read_id) {
+        for (const auto& outbound : actions.messages) {
+            if (outbound.peer_id != peer_id) continue;
+            if (const auto* request = std::get_if<dkv::AppendEntries>(&outbound.message);
+                request && request->read_context == read_id) {
+                return *request;
+            }
+        }
+        expect(false, "missing read probe");
+        return std::nullopt;
+    }
+
     struct ElectedCluster {
         ClusterNode a{1, {2, 3}};
         ClusterNode b{2, {1, 3}};
@@ -315,7 +329,7 @@ namespace {
                "higher-term rejection did not step down and reset election timer");
     }
 
-    void test_read_barrier_waits_for_majority() {
+    void test_read_barrier_waits_for_current_term_and_fresh_quorum() {
         ElectedCluster cluster;
         const auto elected = cluster.elect_a();
         if (!elected) return;
@@ -324,16 +338,18 @@ namespace {
                    std::get<dkv::RaftNodeError>(follower_barrier) ==
                        dkv::RaftNodeError::NotLeader,
                "follower accepted a read barrier");
+        const auto barrier = cluster.a.node->read_barrier();
+        const auto* barrier_actions = actions(barrier, "A did not queue read barrier");
+        if (!barrier_actions) return;
+        const auto read_id = barrier_actions->started_read_id;
+        expect(read_id && barrier_actions->messages.empty() &&
+                   barrier_actions->ready_reads.empty() &&
+                   cluster.a.node->last_index() == 1,
+               "read started before the current-term no-op committed");
+        if (!read_id) return;
+
         const auto first = message_to<dkv::AppendEntries>(*elected, 2);
         if (!first) return;
-        const auto barrier = cluster.a.node->read_barrier();
-        const auto* barrier_actions = actions(barrier, "A did not propose read barrier");
-        if (!barrier_actions) return;
-        expect(barrier_actions->proposed_index == 2 &&
-                   cluster.a.node->last_index() == 2 &&
-                   cluster.a.node->last_applied() == 0,
-               "read barrier was applied without a majority");
-
         const auto first_on_b = cluster.b.node->on_append_entries(1, *first);
         const auto* first_actions = actions(first_on_b, "B did not store first no-op");
         if (!first_actions) return;
@@ -344,31 +360,114 @@ namespace {
         const auto* committed_actions =
             actions(first_committed, "A did not commit leadership no-op");
         if (!committed_actions) return;
-        const auto barrier_append =
-            message_to<dkv::AppendEntries>(*committed_actions, 2);
-        if (!barrier_append) return;
+        const auto probe = read_probe_to(*committed_actions, 2, *read_id);
+        if (!probe) return;
         expect(cluster.a.node->commit_index() == 1 &&
-                   barrier_append->entries.size() == 1 &&
-                   barrier_append->entries[0].index == 2 &&
-                   barrier_append->entries[0].command.type ==
-                       dkv::CommandType::NoOp,
-               "read barrier was not replicated as a current-term no-op");
+                   cluster.a.node->last_applied() == 1 &&
+                   committed_actions->ready_reads.empty() &&
+                   probe->entries.empty() && probe->prev_log_index == 0 &&
+                   probe->leader_commit == 1 &&
+                   read_probe_to(*committed_actions, 3, *read_id),
+               "current-term commit did not start a fresh read round");
 
-        const auto barrier_on_b = cluster.b.node->on_append_entries(1, *barrier_append);
-        const auto* stored_actions = actions(barrier_on_b, "B did not store barrier");
+        const auto stale = cluster.a.node->on_append_reply(2, *first, *first_ack);
+        const auto* stale_actions = actions(stale, "old replication reply was rejected");
+        expect(stale_actions && stale_actions->ready_reads.empty(),
+               "pre-read acknowledgment completed the read");
+
+        const auto probe_on_b = cluster.b.node->on_append_entries(1, *probe);
+        const auto* response = actions(probe_on_b, "B did not answer read probe");
+        if (!response) return;
+        const auto probe_ack = message_to<dkv::AppendEntriesReply>(*response, 1);
+        if (!probe_ack) return;
+        const auto confirmed = cluster.a.node->on_append_reply(2, *probe, *probe_ack);
+        const auto* confirmed_actions = actions(confirmed, "A did not confirm read");
+        expect(confirmed_actions && confirmed_actions->ready_reads ==
+                   std::vector<dkv::ReadyRead>{{*read_id, 1}} &&
+                   cluster.a.node->last_index() == 1,
+               "fresh quorum did not complete read without a log entry");
+        const auto duplicate = cluster.a.node->on_append_reply(2, *probe, *probe_ack);
+        const auto* duplicate_actions = actions(duplicate, "duplicate probe failed");
+        expect(duplicate_actions && duplicate_actions->ready_reads.empty(),
+               "duplicate probe acknowledgment completed a second read");
+
+        const auto next = cluster.a.node->read_barrier();
+        const auto* next_actions = actions(next, "second read did not start");
+        if (!next_actions || !next_actions->started_read_id) return;
+        const auto next_probe = read_probe_to(*next_actions, 2,
+                                               *next_actions->started_read_id);
+        if (!next_probe) return;
+        const auto heartbeat = cluster.a.node->on_heartbeat_timeout();
+        const auto* heartbeat_actions = actions(heartbeat, "heartbeat failed");
+        expect(heartbeat_actions && heartbeat_actions->ready_reads.empty() &&
+                   read_probe_to(*heartbeat_actions, 2,
+                                 *next_actions->started_read_id),
+               "unconfirmed read was not retried on heartbeat");
+        const auto higher_term = cluster.a.node->on_append_reply(2, *next_probe,
+                                                                 {2, false});
+        const auto* stepdown_actions = actions(higher_term, "higher-term probe failed");
+        expect(stepdown_actions && stepdown_actions->ready_reads.empty() &&
+                   cluster.a.node->role() == dkv::RaftRole::Follower &&
+                   cluster.a.node->term() == 2,
+               "higher-term read reply did not cancel the read and step down");
+    }
+
+    void test_concurrent_reads_require_their_own_fresh_ack() {
+        ElectedCluster cluster;
+        const auto elected = cluster.elect_a();
+        if (!elected) return;
+        const auto first = message_to<dkv::AppendEntries>(*elected, 2);
+        if (!first) return;
+        const auto stored = cluster.b.node->on_append_entries(1, *first);
+        const auto* stored_actions = actions(stored, "B did not store election no-op");
         if (!stored_actions) return;
-        const auto barrier_ack =
-            message_to<dkv::AppendEntriesReply>(*stored_actions, 1);
-        if (!barrier_ack) return;
-        const auto applied =
-            cluster.a.node->on_append_reply(2, *barrier_append, *barrier_ack);
-        const auto* applied_actions =
-            actions(applied, "A did not process barrier acknowledgment");
-        expect(applied_actions && cluster.a.node->commit_index() == 2 &&
-                   cluster.a.node->last_applied() == 2 &&
-                   applied_actions->applied ==
-                       std::vector<dkv::AppliedLogEntry>{{2, dkv::ApplyResult::Applied}},
-               "read barrier completed before or after the wrong commit point");
+        const auto ack = message_to<dkv::AppendEntriesReply>(*stored_actions, 1);
+        if (!ack) return;
+        expect(actions(cluster.a.node->on_append_reply(2, *first, *ack),
+                       "A did not commit election no-op") &&
+                   cluster.a.node->commit_index() == 1,
+               "read setup did not commit current-term no-op");
+
+        const auto first_read = cluster.a.node->read_barrier();
+        const auto second_read = cluster.a.node->read_barrier();
+        const auto* first_actions = actions(first_read, "first read did not start");
+        const auto* second_actions = actions(second_read, "second read did not start");
+        if (!first_actions || !second_actions || !first_actions->started_read_id ||
+            !second_actions->started_read_id) return;
+        const auto first_probe = read_probe_to(*first_actions, 2,
+                                              *first_actions->started_read_id);
+        const auto second_probe = read_probe_to(*second_actions, 2,
+                                               *second_actions->started_read_id);
+        if (!first_probe || !second_probe) return;
+        expect(first_probe->read_context != second_probe->read_context &&
+                   cluster.a.node->last_index() == 1,
+               "concurrent reads reused a context or appended a log entry");
+
+        const auto one = cluster.a.node->on_append_reply(2, *first_probe, {1, true});
+        const auto* one_actions = actions(one, "first read reply failed");
+        expect(one_actions && one_actions->ready_reads ==
+                   std::vector<dkv::ReadyRead>{{*first_actions->started_read_id, 1}},
+               "first acknowledgment completed the wrong reads");
+        auto forged = *second_probe;
+        forged.leader_commit = 0;
+        const auto wrong = cluster.a.node->on_append_reply(2, forged, {1, true});
+        const auto* wrong_actions = actions(wrong, "mismatched probe failed");
+        expect(wrong_actions && wrong_actions->ready_reads.empty(),
+               "mismatched probe completed the second read");
+        const auto old = cluster.a.node->on_append_reply(3, *first_probe, {1, true});
+        const auto* old_actions = actions(old, "old probe reply failed");
+        expect(old_actions && old_actions->ready_reads.empty(),
+               "old read context completed a later read");
+        const auto rejected = cluster.a.node->on_append_reply(2, *second_probe,
+                                                              {1, false});
+        const auto* rejected_actions = actions(rejected, "rejected probe failed");
+        expect(rejected_actions && rejected_actions->ready_reads.empty(),
+               "rejected probe completed the second read");
+        const auto two = cluster.a.node->on_append_reply(2, *second_probe, {1, true});
+        const auto* two_actions = actions(two, "second read reply failed");
+        expect(two_actions && two_actions->ready_reads ==
+                   std::vector<dkv::ReadyRead>{{*second_actions->started_read_id, 1}},
+               "second read did not wait for its own acknowledgment");
     }
 }
 
@@ -378,7 +477,8 @@ int main() {
     test_client_write_applies_only_after_majority_ack();
     test_higher_term_reply_steps_down_and_persists_term();
     test_higher_term_vote_request_resets_timer_even_when_denied();
-    test_read_barrier_waits_for_majority();
+    test_read_barrier_waits_for_current_term_and_fresh_quorum();
+    test_concurrent_reads_require_their_own_fresh_ack();
     if (failures != 0) std::cerr << failures << " Raft node tests failed\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

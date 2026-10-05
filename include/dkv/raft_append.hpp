@@ -17,6 +17,8 @@ namespace dkv {
         std::uint64_t prev_log_term{0};
         std::vector<LogEntry> entries;
         std::uint64_t leader_commit{0};
+        // Nonzero only for a read-only heartbeat round. Echoed in replied_to.
+        std::uint64_t read_context{0};
 
         bool operator==(const AppendEntries&) const = default;
     };

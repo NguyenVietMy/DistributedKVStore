@@ -98,16 +98,19 @@ def main(server_executable, client_executable):
             assert stale_read.returncode == 3 and "not leader" in stale_read.stdout, stale_read
             found = client(leader, "get", "x")
             assert found.returncode == 0 and found.stdout == "10\n", found
-            collect_until(lambda: all("applied index 3" in seen[i] for i in active))
             missing = client(leader, "get", "missing")
             assert missing.returncode == 0 and missing.stdout == "(not found)\n", missing
-            collect_until(lambda: all("applied index 4" in seen[i] for i in active))
             deleted = client(leader, "delete", "x")
-            assert deleted.returncode == 0 and "index 5" in deleted.stdout, deleted
-            collect_until(lambda: all("applied index 5" in seen[i] for i in active))
+            assert deleted.returncode == 0 and "index 3" in deleted.stdout, deleted
+            collect_until(lambda: all("applied index 3" in seen[i] for i in active))
             after_delete = client(leader, "get", "x")
             assert after_delete.returncode == 0 and after_delete.stdout == "(not found)\n", after_delete
-            collect_until(lambda: all("applied index 6" in seen[i] for i in active))
+            before_status = len(seen[leader])
+            processes[leader].stdin.write("status\n")
+            processes[leader].stdin.flush()
+            collect_until(lambda: any("role leader" in line
+                                      for line in seen[leader][before_status:]))
+            assert any(" log 3 " in line for line in seen[leader][before_status:]), seen
 
             for node_id in list(active):
                 if node_id == leader:
@@ -127,15 +130,14 @@ def main(server_executable, client_executable):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                collect_until(lambda: "proposed index 7" in seen[leader] and
-                              "proposed index 8" in seen[leader])
+                collect_until(lambda: "proposed index 4" in seen[leader])
                 assert waiting_read.poll() is None, "GET completed without a majority"
                 assert waiting_write.poll() is None, "PUT was acknowledged without a majority"
 
                 # The reported peer has a newer term but a stale log: the vote
                 # is denied, yet the old leader must step down and fail pending writes.
                 sender = follower
-                vote = struct.pack(">BBQQQQQ", 1, 1, sender, term + 1, sender, 0, 0)
+                vote = struct.pack(">BBQQQQQ", 2, 1, sender, term + 1, sender, 0, 0)
                 with socket.create_connection(("127.0.0.1", ports[leader - 1]), 2) as sock:
                     sock.sendall(struct.pack(">I", len(vote)) + vote)
                 read_output, read_error = waiting_read.communicate(timeout=4)

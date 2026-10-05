@@ -57,9 +57,10 @@ that deadline expires, it reports an unknown write outcome and prints the ID
 for a later retry. Single-port mode sends one request and leaves retries to
 the caller.
 
-For `get`, the leader commits and applies a no-op barrier before reading its
-local state. This costs one log entry per read, but prevents stale replies and
-means reads cannot complete without a majority. A follower returns `not leader`.
+For `get`, the leader first waits for its election no-op to commit, then checks
+leadership with a fresh majority heartbeat round before reading its local
+applied state. GET adds no log entry, and it cannot complete without a
+majority. A follower returns `not leader`.
 
 The node console's `put x 10` and `delete x` commands remain local debugging
 proposals: they print a log index without waiting for commitment. An

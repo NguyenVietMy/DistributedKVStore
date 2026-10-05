@@ -40,6 +40,9 @@ namespace {
         round_trip({2, dkv::RequestVoteReply{3, true}, std::nullopt});
         round_trip({1, append, std::nullopt});
         round_trip({2, dkv::AppendEntriesReply{3, true}, append});
+        const dkv::AppendEntries read_probe{3, 1, 0, 0, {}, 1, 42};
+        round_trip({1, read_probe, std::nullopt});
+        round_trip({2, dkv::AppendEntriesReply{3, true}, read_probe});
     }
 
     void test_bad_envelopes() {
@@ -55,11 +58,11 @@ namespace {
         auto encoded = dkv::encode_raft_envelope(
             {1, dkv::RequestVote{3, 1, 0, 0}, std::nullopt});
         auto bytes = std::get<std::vector<std::byte>>(encoded);
-        bytes[0] = std::byte{2};
+        bytes[0] = std::byte{3};
         expect(dkv::decode_raft_envelope(bytes) ==
                    dkv::DecodeRaftEnvelopeResult{dkv::RaftWireError::UnsupportedVersion},
                "unknown wire version was accepted");
-        bytes[0] = std::byte{1};
+        bytes[0] = std::byte{2};
         bytes.push_back(std::byte{0});
         expect(dkv::decode_raft_envelope(bytes) ==
                    dkv::DecodeRaftEnvelopeResult{dkv::RaftWireError::TrailingBytes},

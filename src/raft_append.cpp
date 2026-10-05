@@ -14,6 +14,8 @@ namespace dkv {
         bool valid_entries(const AppendEntries& request) {
             if ((request.prev_log_index == 0) != (request.prev_log_term == 0) ||
                 request.prev_log_term > request.term ||
+                (request.read_context != 0 &&
+                 (request.prev_log_index != 0 || !request.entries.empty())) ||
                 request.entries.size() >
                     std::numeric_limits<std::uint64_t>::max() - request.prev_log_index) {
                 return false;

@@ -61,10 +61,15 @@ namespace dkv {
         return peer_id == peer_ids_[0] || peer_id == peer_ids_[1];
     }
 
+    void RaftNode::drop_leadership() {
+        leader_.reset();
+        read_rounds_.clear();
+        known_leader_.reset();
+    }
+
     RaftNodeResult RaftNode::stop(RaftNodeError error) {
         stopped_ = true;
-        leader_.reset();
-        known_leader_.reset();
+        drop_leadership();
         return error;
     }
 
@@ -86,6 +91,23 @@ namespace dkv {
         return true;
     }
 
+    bool RaftNode::current_term_committed() const {
+        if (commit_index_ == 0 || state_.last_applied() < commit_index_) return false;
+        const auto entry = log_->entry_at(commit_index_);
+        return entry && entry->term == term();
+    }
+
+    void RaftNode::start_waiting_reads(RaftNodeActions& actions) {
+        if (!current_term_committed()) return;
+        for (auto& [id, probe] : read_rounds_) {
+            if (probe) continue;
+            probe = AppendEntries{term(), self_id_, 0, 0, {}, commit_index_, id};
+            for (const auto peer_id : peer_ids_) {
+                actions.messages.push_back({peer_id, *probe});
+            }
+        }
+    }
+
     RaftNodeResult RaftNode::on_election_timeout() {
         if (stopped_) return RaftNodeError::Stopped;
         const auto result = election_.start_election();
@@ -96,8 +118,7 @@ namespace dkv {
                             : RaftNodeError::PersistenceError);
         }
 
-        leader_.reset();
-        known_leader_.reset();
+        drop_leadership();
         const auto& request = std::get<RequestVote>(result);
         RaftNodeActions actions;
         actions.reset_election_timer = true;
@@ -111,8 +132,7 @@ namespace dkv {
         if (stopped_) return RaftNodeError::Stopped;
         if (!leader_) return RaftNodeActions{};
         if (!leader_->active()) {
-            leader_.reset();
-            known_leader_.reset();
+            drop_leadership();
             return RaftNodeActions{};
         }
         RaftNodeActions actions;
@@ -120,6 +140,12 @@ namespace dkv {
         for (const auto peer_id : peer_ids_) {
             if (!queue_append(peer_id, actions)) {
                 return stop(RaftNodeError::InconsistentState);
+            }
+        }
+        for (const auto& [id, probe] : read_rounds_) {
+            if (!probe) continue;
+            for (const auto peer_id : peer_ids_) {
+                actions.messages.push_back({peer_id, *probe});
             }
         }
         return actions;
@@ -137,8 +163,7 @@ namespace dkv {
             return stop(RaftNodeError::PersistenceError);
         }
         if (term() > old_term) {
-            leader_.reset();
-            known_leader_.reset();
+            drop_leadership();
         }
         const auto reply = std::get<RequestVoteReply>(result);
         RaftNodeActions actions;
@@ -158,8 +183,7 @@ namespace dkv {
             return stop(RaftNodeError::PersistenceError);
         }
         if (outcome == VoteReplyOutcome::SteppedDown) {
-            leader_.reset();
-            known_leader_.reset();
+            drop_leadership();
             actions.reset_election_timer = true;
             return actions;
         }
@@ -193,8 +217,7 @@ namespace dkv {
         const auto result = handle_append_entries(
             *metadata_, *log_, commit_index_, request);
         if (term() > old_term) {
-            leader_.reset();
-            known_leader_.reset();
+            drop_leadership();
         }
         if (const auto* error = std::get_if<AppendEntriesHandleError>(&result)) {
             if (*error == AppendEntriesHandleError::InvalidRequest) {
@@ -209,7 +232,7 @@ namespace dkv {
         RaftNodeActions actions;
         if (request.term != 0 && request.term == reply.term) {
             election_.observe_leader(request.term);
-            leader_.reset();
+            drop_leadership();
             known_leader_ = peer_id;
             actions.reset_election_timer = true;
         }
@@ -233,7 +256,7 @@ namespace dkv {
                     PersistentMetadataUpdateResult::Persisted) {
                     return stop(RaftNodeError::PersistenceError);
                 }
-                known_leader_.reset();
+                drop_leadership();
                 actions.reset_election_timer = true;
             }
             return actions;
@@ -247,8 +270,7 @@ namespace dkv {
             return stop(RaftNodeError::InconsistentState);
         }
         if (outcome == AppendReplyOutcome::SteppedDown) {
-            leader_.reset();
-            known_leader_.reset();
+            drop_leadership();
             actions.reset_election_timer = true;
             return actions;
         }
@@ -259,12 +281,25 @@ namespace dkv {
             for (const auto id : peer_ids_) {
                 if (!queue_append(id, actions)) return stop(RaftNodeError::InconsistentState);
             }
+            start_waiting_reads(actions);
         } else if (outcome == AppendReplyOutcome::Recorded) {
             const auto progress = leader_->progress(peer_id);
             if (!progress) return stop(RaftNodeError::InconsistentState);
             if (progress->next_index <= log_->last_index() &&
                 !queue_append(peer_id, actions)) {
                 return stop(RaftNodeError::InconsistentState);
+            }
+        }
+        if (sent_request.read_context != 0 && reply.term == term() && reply.success) {
+            const auto pending = read_rounds_.find(sent_request.read_context);
+            if (pending != read_rounds_.end() && pending->second &&
+                *pending->second == sent_request) {
+                const auto index = pending->second->leader_commit;
+                if (state_.last_applied() < index) {
+                    return stop(RaftNodeError::InconsistentState);
+                }
+                actions.ready_reads.push_back({pending->first, index});
+                read_rounds_.erase(pending);
             }
         }
         return actions;
@@ -278,7 +313,15 @@ namespace dkv {
     }
 
     RaftNodeResult RaftNode::read_barrier() {
-        return append_as_leader({CommandType::NoOp, "", ""});
+        if (stopped_) return RaftNodeError::Stopped;
+        if (!leader_ || !leader_->active()) return RaftNodeError::NotLeader;
+        if (next_read_id_ == 0) return stop(RaftNodeError::InconsistentState);
+        const auto id = next_read_id_++;
+        read_rounds_.emplace(id, std::nullopt);
+        RaftNodeActions actions;
+        actions.started_read_id = id;
+        start_waiting_reads(actions);
+        return actions;
     }
 
     RaftNodeResult RaftNode::append_as_leader(const Command& command) {
