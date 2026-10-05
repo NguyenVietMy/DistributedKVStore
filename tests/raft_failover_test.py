@@ -30,6 +30,7 @@ def main(server_binary, client_binary):
     active = set()
     lines = {1: [], 2: [], 3: []}
     pending = {1: b"", 2: b"", 3: b""}
+    rescuing = None
 
     with tempfile.TemporaryDirectory(prefix="dkv-failover-") as directory:
         def start(node_id):
@@ -134,6 +135,14 @@ def main(server_binary, client_binary):
             try:
                 collect_until(lambda: "proposed index 3" in lines[old_leader])
                 assert uncertain.poll() is None, "unreplicated write was acknowledged"
+                rescue_id = "fedcba98765432100123456789abcdef"
+                rescuing = subprocess.Popen(
+                    [str(client_binary), *(str(port) for port in ports),
+                     "put", "rescued", "yes", rescue_id],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                collect_until(lambda: "proposed index 4" in lines[old_leader])
+                assert rescuing.poll() is None, "write was acknowledged without a majority"
                 stop(old_leader)
                 output, error = uncertain.communicate(timeout=4)
                 assert uncertain.returncode == 4 and "outcome unknown" in error, (
@@ -146,6 +155,11 @@ def main(server_binary, client_binary):
             for node_id in survivors:
                 start(node_id)
             new_leader = elected_leader(survivors)
+            rescue_output, rescue_error = rescuing.communicate(timeout=10)
+            assert rescuing.returncode == 0 and "committed term" in rescue_output, (
+                rescuing.returncode, rescue_output, rescue_error, lines)
+            rescued = client(new_leader, "get", "rescued")
+            assert rescued.returncode == 0 and rescued.stdout == "yes\n", rescued
             old_value = client(new_leader, "get", "x")
             assert old_value.returncode == 0 and old_value.stdout == "old\n", old_value
             absent = client(new_leader, "get", "ghost")
@@ -190,7 +204,13 @@ def main(server_binary, client_binary):
                 retried_after_restart.stdout == retried.stdout), retried_after_restart
             unchanged = client(restarted_leader, "get", "x")
             assert unchanged.returncode == 0 and unchanged.stdout == "new\n", unchanged
+            recovered_rescue = client(restarted_leader, "get", "rescued")
+            assert recovered_rescue.returncode == 0 and (
+                recovered_rescue.stdout == "yes\n"), recovered_rescue
         finally:
+            if rescuing is not None and rescuing.poll() is None:
+                rescuing.kill()
+                rescuing.communicate()
             for node_id in list(active):
                 process = processes[node_id]
                 if process.poll() is None:

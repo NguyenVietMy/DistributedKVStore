@@ -135,6 +135,10 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_server_test.py
                     $<TARGET_FILE:dkv_node>
                     $<TARGET_FILE:dkv_client>)
+            add_test(NAME client_retry_test
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_retry_test.py
+                    $<TARGET_FILE:dkv_client>)
             add_test(NAME raft_failover_test
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/raft_failover_test.py
