@@ -1,4 +1,5 @@
 #include "dkv/raft_wire.hpp"
+#include "dkv/crc32.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -16,6 +17,15 @@ namespace {
         }
     }
 
+    void refresh_checksum(std::vector<std::byte>& bytes) {
+        const auto checksum = dkv::crc32(
+            std::span<const std::byte>(bytes).first(bytes.size() - 4));
+        for (int i = 0; i < 4; ++i) {
+            bytes[bytes.size() - 4 + i] =
+                static_cast<std::byte>((checksum >> (24 - 8 * i)) & 0xff);
+        }
+    }
+
     void round_trip(const dkv::RaftEnvelope& envelope) {
         const auto encoded = dkv::encode_raft_envelope(envelope);
         const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
@@ -24,6 +34,16 @@ namespace {
         const auto decoded = dkv::decode_raft_envelope(*bytes);
         const auto* received = std::get_if<dkv::RaftEnvelope>(&decoded);
         expect(received && *received == envelope, "Raft wire round trip changed message");
+        auto corrupted = *bytes;
+        corrupted[2] ^= std::byte{1};
+        expect(dkv::decode_raft_envelope(corrupted) ==
+                   dkv::DecodeRaftEnvelopeResult{dkv::RaftWireError::ChecksumMismatch},
+               "corrupted Raft message was accepted");
+        corrupted = *bytes;
+        corrupted.back() ^= std::byte{1};
+        expect(dkv::decode_raft_envelope(corrupted) ==
+                   dkv::DecodeRaftEnvelopeResult{dkv::RaftWireError::ChecksumMismatch},
+               "corrupted Raft checksum was accepted");
         const auto truncated = dkv::decode_raft_envelope(
             std::span<const std::byte>(*bytes).first(bytes->size() - 1));
         expect(std::holds_alternative<dkv::RaftWireError>(truncated),
@@ -58,12 +78,13 @@ namespace {
         auto encoded = dkv::encode_raft_envelope(
             {1, dkv::RequestVote{3, 1, 0, 0}, std::nullopt});
         auto bytes = std::get<std::vector<std::byte>>(encoded);
-        bytes[0] = std::byte{3};
+        bytes[0] = std::byte{2};
         expect(dkv::decode_raft_envelope(bytes) ==
                    dkv::DecodeRaftEnvelopeResult{dkv::RaftWireError::UnsupportedVersion},
-               "unknown wire version was accepted");
-        bytes[0] = std::byte{2};
-        bytes.push_back(std::byte{0});
+               "previous Raft wire version was accepted");
+        bytes[0] = std::byte{3};
+        bytes.insert(bytes.end() - 4, std::byte{0});
+        refresh_checksum(bytes);
         expect(dkv::decode_raft_envelope(bytes) ==
                    dkv::DecodeRaftEnvelopeResult{dkv::RaftWireError::TrailingBytes},
                "trailing wire bytes were accepted");

@@ -1,4 +1,5 @@
 #include "dkv/client_wire.hpp"
+#include "dkv/crc32.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -16,6 +17,30 @@ namespace {
         }
     }
 
+    void refresh_checksum(std::vector<std::byte>& bytes) {
+        const auto checksum = dkv::crc32(
+            std::span<const std::byte>(bytes).first(bytes.size() - 4));
+        for (int i = 0; i < 4; ++i) {
+            bytes[bytes.size() - 4 + i] =
+                static_cast<std::byte>((checksum >> (24 - 8 * i)) & 0xff);
+        }
+    }
+
+    template <typename Decode>
+    void expect_corruption_rejected(const std::vector<std::byte>& bytes,
+                                    Decode decode, std::string_view message) {
+        auto corrupted = bytes;
+        corrupted[bytes.size() - 5] ^= std::byte{1};
+        expect(decode(corrupted) ==
+                   decltype(decode(corrupted)){dkv::ClientWireError::ChecksumMismatch},
+               message);
+        corrupted = bytes;
+        corrupted.back() ^= std::byte{1};
+        expect(decode(corrupted) ==
+                   decltype(decode(corrupted)){dkv::ClientWireError::ChecksumMismatch},
+               message);
+    }
+
     void test_requests() {
         dkv::RequestId id;
         id.bytes[0] = 0x42;
@@ -30,6 +55,8 @@ namespace {
             expect(dkv::decode_client_request(*bytes) ==
                        dkv::DecodeClientRequestResult{request},
                    "write request did not round trip");
+            expect_corruption_rejected(*bytes, dkv::decode_client_request,
+                                       "corrupted write request was accepted");
             auto truncated = *bytes;
             truncated.pop_back();
             expect(std::holds_alternative<dkv::ClientWireError>(
@@ -58,8 +85,11 @@ namespace {
             expect(dkv::decode_client_reply(*bytes) ==
                        dkv::DecodeClientReplyResult{reply},
                    "write reply did not round trip");
+            expect_corruption_rejected(*bytes, dkv::decode_client_reply,
+                                       "corrupted write reply was accepted");
             auto malformed = *bytes;
             malformed[2] = std::byte{0};
+            refresh_checksum(malformed);
             expect(dkv::decode_client_reply(malformed) ==
                        dkv::DecodeClientReplyResult{
                            dkv::ClientWireError::InvalidMessage},
@@ -77,6 +107,8 @@ namespace {
             expect(dkv::decode_client_read_request(*request_bytes) ==
                        dkv::DecodeClientReadRequestResult{request},
                    "GET request did not round trip");
+            expect_corruption_rejected(*request_bytes, dkv::decode_client_read_request,
+                                       "corrupted GET request was accepted");
             auto malformed = *request_bytes;
             malformed.pop_back();
             expect(std::holds_alternative<dkv::ClientWireError>(
@@ -100,6 +132,8 @@ namespace {
             expect(dkv::decode_client_read_reply(*bytes) ==
                        dkv::DecodeClientReadReplyResult{reply},
                    "GET reply did not round trip");
+            expect_corruption_rejected(*bytes, dkv::decode_client_read_reply,
+                                       "corrupted GET reply was accepted");
         }
         expect(dkv::encode_client_read_reply(
                    {dkv::ClientReadStatus::Found, 3, 4, 1, std::nullopt}) ==
@@ -112,11 +146,13 @@ namespace {
         const auto encoded_request = dkv::encode_client_status_request(request);
         const auto* request_bytes =
             std::get_if<std::vector<std::byte>>(&encoded_request);
-        expect(request_bytes && request_bytes->size() == 2 &&
+        expect(request_bytes && request_bytes->size() == 6 &&
                    dkv::decode_client_status_request(*request_bytes) ==
                        dkv::DecodeClientStatusRequestResult{request},
                "STATUS request did not round trip");
         if (request_bytes) {
+            expect_corruption_rejected(*request_bytes, dkv::decode_client_status_request,
+                                       "corrupted STATUS request was accepted");
             auto malformed = *request_bytes;
             malformed.push_back(std::byte{0});
             expect(dkv::decode_client_status_request(malformed) ==
@@ -124,11 +160,11 @@ namespace {
                            dkv::ClientWireError::InvalidMessage},
                    "STATUS request with a payload was accepted");
             malformed = *request_bytes;
-            malformed[0] = std::byte{2};
+            malformed[0] = std::byte{1};
             expect(dkv::decode_client_status_request(malformed) ==
                        dkv::DecodeClientStatusRequestResult{
                            dkv::ClientWireError::UnsupportedVersion},
-                   "unknown STATUS wire version was accepted");
+                   "previous STATUS wire version was accepted");
         }
 
         dkv::ClientStatusReply follower{dkv::ClientStatusCode::Ok, 2,
@@ -144,9 +180,11 @@ namespace {
                                   dkv::ClientStatusReply{}}) {
             const auto encoded = dkv::encode_client_status_reply(reply);
             const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
-            expect(bytes && bytes->size() == 100,
+            expect(bytes && bytes->size() == 104,
                    "could not encode fixed-size STATUS reply");
             if (!bytes) continue;
+            expect_corruption_rejected(*bytes, dkv::decode_client_status_reply,
+                                       "corrupted STATUS reply was accepted");
             expect(dkv::decode_client_status_reply(*bytes) ==
                        dkv::DecodeClientStatusReplyResult{reply},
                    "STATUS reply did not round trip");
@@ -162,6 +200,7 @@ namespace {
         if (bytes) {
             auto malformed = *bytes;
             malformed[3] = std::byte{9};
+            refresh_checksum(malformed);
             expect(dkv::decode_client_status_reply(malformed) ==
                        dkv::DecodeClientStatusReplyResult{
                            dkv::ClientWireError::InvalidMessage},
@@ -169,6 +208,7 @@ namespace {
             malformed = *bytes;
             malformed[60] = std::byte{0};
             malformed[67] = std::byte{0};
+            refresh_checksum(malformed);
             expect(dkv::decode_client_status_reply(malformed) ==
                        dkv::DecodeClientStatusReplyResult{
                            dkv::ClientWireError::InvalidMessage},

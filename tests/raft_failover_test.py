@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 
 
@@ -119,7 +120,8 @@ def main(server_binary, client_binary):
             key, value = b"x", b"old"
             command = struct.pack(">BBII", 2, 1, len(key), len(value))
             command += bytes.fromhex(original_id) + key + value
-            request = bytes((1, 5)) + command
+            request = bytes((2, 5)) + command
+            request += struct.pack(">I", zlib.crc32(request))
             with socket.create_connection(("127.0.0.1", ports[old_leader - 1]), 2) as sock:
                 sock.sendall(struct.pack(">I", len(request)) + request)
             collect_until(lambda: all("applied index 2" in lines[i] for i in active))

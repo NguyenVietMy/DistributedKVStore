@@ -1,5 +1,6 @@
 #include "dkv/raft_wire.hpp"
 
+#include "dkv/crc32.hpp"
 #include "dkv/log_entry_codec.hpp"
 
 #include <cstdint>
@@ -8,6 +9,8 @@
 
 namespace dkv {
     namespace {
+        constexpr std::size_t checksum_size = 4;
+
         void put_u8(std::vector<std::byte>& out, std::uint8_t value) {
             out.push_back(static_cast<std::byte>(value));
         }
@@ -69,14 +72,14 @@ namespace dkv {
             for (const auto& entry : request.entries) {
                 const auto encoded = encode_log_entry(entry);
                 const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
-                if (!bytes || bytes->size() > max_raft_frame_size - 4 ||
-                    out.size() > max_raft_frame_size - bytes->size() - 4) {
+                if (!bytes || bytes->size() > max_raft_frame_size - 4 - checksum_size ||
+                    out.size() > max_raft_frame_size - bytes->size() - 4 - checksum_size) {
                     return false;
                 }
                 put_u32(out, static_cast<std::uint32_t>(bytes->size()));
                 out.insert(out.end(), bytes->begin(), bytes->end());
             }
-            return out.size() <= max_raft_frame_size;
+            return out.size() <= max_raft_frame_size - checksum_size;
         }
 
         bool read_append(Reader& reader, AppendEntries& request) {
@@ -114,7 +117,7 @@ namespace dkv {
             return RaftWireError::InvalidEnvelope;
         }
         std::vector<std::byte> out;
-        put_u8(out, 2); // wire version
+        put_u8(out, 3); // wire version
         put_u8(out, static_cast<std::uint8_t>(envelope.message.index() + 1));
         put_u64(out, envelope.sender_id);
         if (const auto* value = std::get_if<RequestVote>(&envelope.message)) {
@@ -135,12 +138,26 @@ namespace dkv {
             put_u8(out, reply.success ? 1 : 0);
             if (!put_append(out, *envelope.replied_to)) return RaftWireError::TooLarge;
         }
-        if (out.size() > max_raft_frame_size) return RaftWireError::TooLarge;
+        if (out.size() > max_raft_frame_size - checksum_size) {
+            return RaftWireError::TooLarge;
+        }
+        put_u32(out, crc32(out));
         return out;
     }
 
     DecodeRaftEnvelopeResult decode_raft_envelope(std::span<const std::byte> bytes) {
         if (bytes.size() > max_raft_frame_size) return RaftWireError::TooLarge;
+        if (bytes.size() < 10 + checksum_size) return RaftWireError::Truncated;
+        if (bytes[0] != std::byte{3}) return RaftWireError::UnsupportedVersion;
+        std::uint32_t expected_checksum = 0;
+        for (const auto octet : bytes.last(checksum_size)) {
+            expected_checksum = (expected_checksum << 8) |
+                std::to_integer<std::uint32_t>(octet);
+        }
+        if (crc32(bytes.first(bytes.size() - checksum_size)) != expected_checksum) {
+            return RaftWireError::ChecksumMismatch;
+        }
+        bytes = bytes.first(bytes.size() - checksum_size);
         Reader reader{bytes};
         std::uint8_t version = 0;
         std::uint8_t kind = 0;
@@ -148,7 +165,7 @@ namespace dkv {
         if (!reader.u8(version) || !reader.u8(kind) || !reader.u64(sender)) {
             return RaftWireError::Truncated;
         }
-        if (version != 2) return RaftWireError::UnsupportedVersion;
+        if (version != 3) return RaftWireError::UnsupportedVersion;
         if (sender == 0) return RaftWireError::InvalidEnvelope;
         RaftEnvelope envelope;
         envelope.sender_id = sender;

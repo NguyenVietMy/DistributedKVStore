@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 
 
@@ -155,11 +156,21 @@ def main(server_executable, client_executable):
                 "1", "2", "3"
             ], cluster_status
             with socket.create_connection(("127.0.0.1", ports[follower - 1]), 2) as sock:
-                malformed_status = b"\x01\x09\x00"
+                malformed_status = b"\x02\x09\x00"
+                malformed_status += struct.pack(">I", zlib.crc32(malformed_status))
                 sock.sendall(struct.pack(">I", len(malformed_status)) + malformed_status)
                 reply_size = struct.unpack(">I", recv_exact(sock, 4))[0]
                 reply = recv_exact(sock, reply_size)
-                assert reply_size == 100 and reply[:4] == b"\x01\x0a\x02\x00", reply
+                assert reply_size == 104 and reply[:4] == b"\x02\x0a\x02\x00", reply
+                assert reply[-4:] == struct.pack(">I", zlib.crc32(reply[:-4])), reply
+            with socket.create_connection(("127.0.0.1", ports[follower - 1]), 2) as sock:
+                corrupted = bytearray(b"\x02\x09")
+                corrupted.extend(struct.pack(">I", zlib.crc32(corrupted)))
+                corrupted[-1] ^= 1
+                sock.sendall(struct.pack(">I", len(corrupted)) + corrupted)
+                reply_size = struct.unpack(">I", recv_exact(sock, 4))[0]
+                reply = recv_exact(sock, reply_size)
+                assert reply_size == 104 and reply[:4] == b"\x02\x0a\x02\x00", reply
 
             rejected = client(follower, "put", "wrong", "value")
             assert rejected.returncode == 3 and "not leader" in rejected.stdout, rejected
@@ -214,7 +225,14 @@ def main(server_executable, client_executable):
                 # The reported peer has a newer term but a stale log: the vote
                 # is denied, yet the old leader must step down and fail pending writes.
                 sender = follower
-                vote = struct.pack(">BBQQQQQ", 2, 1, sender, term + 1, sender, 0, 0)
+                vote = struct.pack(">BBQQQQQ", 3, 1, sender, term + 1, sender, 0, 0)
+                vote += struct.pack(">I", zlib.crc32(vote))
+                corrupted_vote = bytearray(vote)
+                corrupted_vote[11] ^= 1
+                with socket.create_connection(("127.0.0.1", ports[leader - 1]), 2) as sock:
+                    sock.sendall(struct.pack(">I", len(corrupted_vote)) + corrupted_vote)
+                unchanged = client(leader, "status")
+                assert unchanged.returncode == 0 and " role leader " in unchanged.stdout, unchanged
                 with socket.create_connection(("127.0.0.1", ports[leader - 1]), 2) as sock:
                     sock.sendall(struct.pack(">I", len(vote)) + vote)
                 read_output, read_error = waiting_read.communicate(timeout=4)

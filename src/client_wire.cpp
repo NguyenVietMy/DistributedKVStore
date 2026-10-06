@@ -1,13 +1,15 @@
 #include "dkv/client_wire.hpp"
 
 #include "dkv/command_codec.hpp"
+#include "dkv/crc32.hpp"
 
 #include <cstring>
 #include <utility>
 
 namespace dkv {
     namespace {
-        constexpr std::byte version{1};
+        constexpr std::byte version{2};
+        constexpr std::size_t checksum_size = 4;
         constexpr std::byte request_kind{5};
         constexpr std::byte reply_kind{6};
         constexpr std::byte read_request_kind{7};
@@ -31,6 +33,15 @@ namespace dkv {
                     std::to_integer<std::uint32_t>(bytes[at + i]);
             }
             return result;
+        }
+
+        void append_checksum(std::vector<std::byte>& bytes) {
+            put_u32(bytes, crc32(bytes));
+        }
+
+        bool valid_checksum(std::span<const std::byte> bytes) {
+            return read_u32(bytes, bytes.size() - checksum_size) ==
+                   crc32(bytes.first(bytes.size() - checksum_size));
         }
 
         void put_u64(std::vector<std::byte>& bytes, std::uint64_t value) {
@@ -100,19 +111,22 @@ namespace dkv {
         auto encoded = encode_command(request.command);
         const auto* command = std::get_if<std::vector<std::byte>>(&encoded);
         if (!command) return ClientWireError::InvalidMessage;
-        if (command->size() > max_client_request_size - 2) {
+        if (command->size() > max_client_request_size - 2 - checksum_size) {
             return ClientWireError::TooLarge;
         }
         std::vector<std::byte> bytes{version, request_kind};
         bytes.insert(bytes.end(), command->begin(), command->end());
+        append_checksum(bytes);
         return bytes;
     }
 
     DecodeClientRequestResult decode_client_request(
         std::span<const std::byte> bytes) {
         if (bytes.size() > max_client_request_size) return ClientWireError::TooLarge;
-        if (bytes.size() < 2) return ClientWireError::Truncated;
+        if (bytes.size() < 2 + checksum_size) return ClientWireError::Truncated;
         if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (!valid_checksum(bytes)) return ClientWireError::ChecksumMismatch;
+        bytes = bytes.first(bytes.size() - checksum_size);
         if (bytes[1] != request_kind) return ClientWireError::InvalidMessage;
         const auto decoded = decode_command(bytes.subspan(2));
         const auto* command = std::get_if<Command>(&decoded);
@@ -133,13 +147,16 @@ namespace dkv {
         put_u64(bytes, reply.term);
         put_u64(bytes, reply.index);
         put_u64(bytes, reply.leader_hint);
+        append_checksum(bytes);
         return bytes;
     }
 
     DecodeClientReplyResult decode_client_reply(std::span<const std::byte> bytes) {
-        if (bytes.size() < reply_size) return ClientWireError::Truncated;
-        if (bytes.size() != reply_size) return ClientWireError::InvalidMessage;
+        if (bytes.size() < reply_size + checksum_size) return ClientWireError::Truncated;
+        if (bytes.size() != reply_size + checksum_size) return ClientWireError::InvalidMessage;
         if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (!valid_checksum(bytes)) return ClientWireError::ChecksumMismatch;
+        bytes = bytes.first(bytes.size() - checksum_size);
         if (bytes[1] != reply_kind) return ClientWireError::InvalidMessage;
         const auto status = std::to_integer<std::uint8_t>(bytes[2]);
         if (!valid_status(status)) return ClientWireError::InvalidMessage;
@@ -154,7 +171,7 @@ namespace dkv {
 
     EncodeClientResult encode_client_read_request(
         const ClientReadRequest& request) {
-        if (request.key.size() > max_client_request_size - 6) {
+        if (request.key.size() > max_client_request_size - 6 - checksum_size) {
             return ClientWireError::TooLarge;
         }
         std::vector<std::byte> bytes{version, read_request_kind};
@@ -163,14 +180,17 @@ namespace dkv {
             bytes.push_back(static_cast<std::byte>(
                 static_cast<unsigned char>(character)));
         }
+        append_checksum(bytes);
         return bytes;
     }
 
     DecodeClientReadRequestResult decode_client_read_request(
         std::span<const std::byte> bytes) {
         if (bytes.size() > max_client_request_size) return ClientWireError::TooLarge;
-        if (bytes.size() < 6) return ClientWireError::Truncated;
+        if (bytes.size() < 6 + checksum_size) return ClientWireError::Truncated;
         if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (!valid_checksum(bytes)) return ClientWireError::ChecksumMismatch;
+        bytes = bytes.first(bytes.size() - checksum_size);
         if (bytes[1] != read_request_kind) return ClientWireError::InvalidMessage;
         const auto length = read_u32(bytes, 2);
         if (length != bytes.size() - 6) return ClientWireError::InvalidMessage;
@@ -188,7 +208,7 @@ namespace dkv {
             return ClientWireError::InvalidMessage;
         }
         const auto value_size = reply.value ? reply.value->size() : 0;
-        if (value_size > max_client_frame_size - read_reply_size) {
+        if (value_size > max_client_frame_size - read_reply_size - checksum_size) {
             return ClientWireError::TooLarge;
         }
         std::vector<std::byte> bytes{version, read_reply_kind,
@@ -203,14 +223,17 @@ namespace dkv {
                     static_cast<unsigned char>(character)));
             }
         }
+        append_checksum(bytes);
         return bytes;
     }
 
     DecodeClientReadReplyResult decode_client_read_reply(
         std::span<const std::byte> bytes) {
         if (bytes.size() > max_client_frame_size) return ClientWireError::TooLarge;
-        if (bytes.size() < read_reply_size) return ClientWireError::Truncated;
+        if (bytes.size() < read_reply_size + checksum_size) return ClientWireError::Truncated;
         if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (!valid_checksum(bytes)) return ClientWireError::ChecksumMismatch;
+        bytes = bytes.first(bytes.size() - checksum_size);
         if (bytes[1] != read_reply_kind) return ClientWireError::InvalidMessage;
         const auto status_byte = std::to_integer<std::uint8_t>(bytes[2]);
         if (!valid_read_status(status_byte)) return ClientWireError::InvalidMessage;
@@ -237,14 +260,17 @@ namespace dkv {
     }
 
     EncodeClientResult encode_client_status_request(const ClientStatusRequest&) {
-        return std::vector<std::byte>{version, status_request_kind};
+        std::vector<std::byte> bytes{version, status_request_kind};
+        append_checksum(bytes);
+        return bytes;
     }
 
     DecodeClientStatusRequestResult decode_client_status_request(
         std::span<const std::byte> bytes) {
-        if (bytes.size() < 2) return ClientWireError::Truncated;
-        if (bytes.size() != 2) return ClientWireError::InvalidMessage;
+        if (bytes.size() < 2 + checksum_size) return ClientWireError::Truncated;
+        if (bytes.size() != 2 + checksum_size) return ClientWireError::InvalidMessage;
         if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (!valid_checksum(bytes)) return ClientWireError::ChecksumMismatch;
         if (bytes[1] != status_request_kind) return ClientWireError::InvalidMessage;
         return ClientStatusRequest{};
     }
@@ -265,14 +291,17 @@ namespace dkv {
             put_u64(bytes, peer.next_index);
             put_u64(bytes, peer.match_index);
         }
+        append_checksum(bytes);
         return bytes;
     }
 
     DecodeClientStatusReplyResult decode_client_status_reply(
         std::span<const std::byte> bytes) {
-        if (bytes.size() < status_reply_size) return ClientWireError::Truncated;
-        if (bytes.size() != status_reply_size) return ClientWireError::InvalidMessage;
+        if (bytes.size() < status_reply_size + checksum_size) return ClientWireError::Truncated;
+        if (bytes.size() != status_reply_size + checksum_size) return ClientWireError::InvalidMessage;
         if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (!valid_checksum(bytes)) return ClientWireError::ChecksumMismatch;
+        bytes = bytes.first(bytes.size() - checksum_size);
         if (bytes[1] != status_reply_kind) return ClientWireError::InvalidMessage;
         ClientStatusReply reply;
         reply.status = static_cast<ClientStatusCode>(

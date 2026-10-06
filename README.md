@@ -85,3 +85,8 @@ linearizable client read. Use `quit` to stop a node.
 The current TCP transport is localhost-only. Raft messages use one short-lived
 connection each. A client request keeps its connection open until completion,
 step-down, or disconnection.
+
+TCP frames start with a four-byte big-endian message length. Each message ends
+with a four-byte big-endian CRC32 covering its version, kind, and payload.
+The current client wire version is 2 and the Raft wire version is 3; older
+versions are rejected.

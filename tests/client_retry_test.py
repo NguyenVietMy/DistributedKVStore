@@ -6,7 +6,12 @@ import struct
 import subprocess
 import sys
 import threading
+import zlib
 from pathlib import Path
+
+
+def checked(body):
+    return body + struct.pack(">I", zlib.crc32(body))
 
 
 def receive_exact(connection, length):
@@ -37,7 +42,7 @@ def serve(listener, node_id, response, received, order, errors):
 
 
 def redirect_loop(listener, node_id, leader_hint, stop, order, errors):
-    reply = struct.pack(">BBBQQQ", 1, 6, 2, 7, 0, leader_hint)
+    reply = checked(struct.pack(">BBBQQQ", 2, 6, 2, 7, 0, leader_hint))
     try:
         listener.settimeout(0.1)
         while not stop.is_set():
@@ -71,8 +76,8 @@ def test_write_retry(client_binary):
     # Node 1 redirects directly to node 3. Node 3 drops the reply after
     # receiving the write. The retry then finds node 2.
     responses = {
-        1: struct.pack(">BBBQQQ", 1, 6, 2, 7, 0, 3),
-        2: struct.pack(">BBBQQQ", 1, 6, 1, 7, 9, 2),
+        1: checked(struct.pack(">BBBQQQ", 2, 6, 2, 7, 0, 3)),
+        2: checked(struct.pack(">BBBQQQ", 2, 6, 1, 7, 9, 2)),
         3: None,
     }
     threads = [threading.Thread(
@@ -96,7 +101,8 @@ def test_write_retry(client_binary):
     assert received[1] == received[2] == received[3], "retry changed the write request"
     match = re.search(r"request id ([0-9a-f]{32})", result.stderr)
     assert match, result.stderr
-    assert received[1][:3] == bytes((1, 5, 2)), received[1][:3]
+    assert received[1][:3] == bytes((2, 5, 2)), received[1][:3]
+    assert received[1][-4:] == struct.pack(">I", zlib.crc32(received[1][:-4]))
     assert received[1][12:28].hex() == match.group(1), "printed ID differs from sent ID"
 
 
@@ -114,8 +120,8 @@ def test_read_routing(client_binary):
     errors = []
     value = b"10"
     responses = {
-        1: struct.pack(">BBBQQQI", 1, 8, 3, 7, 0, 3, 0),
-        3: struct.pack(">BBBQQQI", 1, 8, 1, 7, 9, 3, len(value)) + value,
+        1: checked(struct.pack(">BBBQQQI", 2, 8, 3, 7, 0, 3, 0)),
+        3: checked(struct.pack(">BBBQQQI", 2, 8, 1, 7, 9, 3, len(value)) + value),
     }
     threads = [threading.Thread(
         target=serve,
@@ -150,7 +156,7 @@ def test_stale_hint_cycle(client_binary):
     order = []
     errors = []
     received = {}
-    committed = struct.pack(">BBBQQQ", 1, 6, 1, 7, 9, 3)
+    committed = checked(struct.pack(">BBBQQQ", 2, 6, 1, 7, 9, 3))
     threads = [
         threading.Thread(target=redirect_loop,
                          args=(listeners[0], 1, 2, stop, order, errors), daemon=True),

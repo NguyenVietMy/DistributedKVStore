@@ -102,7 +102,8 @@ namespace dkv {
         InvalidMessage,
         TooLarge,
         Truncated,
-        UnsupportedVersion
+        UnsupportedVersion,
+        ChecksumMismatch
     };
 
     using EncodeClientResult = std::variant<std::vector<std::byte>, ClientWireError>;

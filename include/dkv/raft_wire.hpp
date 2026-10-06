@@ -26,7 +26,8 @@ namespace dkv {
         TooLarge,
         Truncated,
         UnsupportedVersion,
-        TrailingBytes
+        TrailingBytes,
+        ChecksumMismatch
     };
 
     constexpr std::size_t max_raft_frame_size = 8 * 1024 * 1024;
