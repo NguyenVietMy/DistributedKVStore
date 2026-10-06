@@ -1,4 +1,4 @@
-"""End-to-end writes and linearizable reads through the client protocol."""
+"""End-to-end client writes, reads, and status across Raft roles."""
 
 import os
 import re
@@ -21,6 +21,47 @@ def free_ports():
     finally:
         for item in reservations:
             item.close()
+
+
+def recv_exact(sock, size):
+    result = b""
+    while len(result) < size:
+        chunk = sock.recv(size - len(result))
+        assert chunk, "connection closed before complete reply"
+        result += chunk
+    return result
+
+
+def check_isolated_candidate(server_executable, client_executable):
+    ports = free_ports()
+    with tempfile.TemporaryDirectory(prefix="dkv-candidate-status-") as temporary:
+        process = subprocess.Popen(
+            [str(server_executable), "1", temporary,
+             *(str(port) for port in ports)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                status = subprocess.run(
+                    [str(client_executable), str(ports[0]), "status"],
+                    text=True, capture_output=True, timeout=2,
+                )
+                if status.returncode == 0 and re.fullmatch(
+                    r"node 1 role candidate term [1-9]\d* leader unknown "
+                    r"log 0 commit 0 applied 0 "
+                    r"peer 2 progress unknown peer 3 progress unknown\n",
+                    status.stdout,
+                ):
+                    return
+                assert process.poll() is None, "isolated candidate exited"
+                time.sleep(0.05)
+            raise AssertionError(f"isolated node never reported candidate status: {status}")
+        finally:
+            process.terminate()
+            process.wait(timeout=2)
+            process.stderr.close()
 
 
 def main(server_executable, client_executable):
@@ -88,12 +129,48 @@ def main(server_executable, client_executable):
                           if any("role leader" in line for line in seen[i]))
             follower = next(i for i in active if i != leader)
 
+            for node_id in sorted(active):
+                status = client(node_id, "status")
+                assert status.returncode == 0, status
+                line = status.stdout.strip()
+                expected_role = "leader" if node_id == leader else "follower"
+                assert re.search(
+                    rf"^node {node_id} role {expected_role} term \d+ "
+                    rf"leader {leader} log \d+ commit \d+ applied \d+",
+                    line,
+                ), status
+                for peer_id in active - {node_id}:
+                    if node_id == leader:
+                        assert re.search(
+                            rf"peer {peer_id} next \d+ match \d+", line
+                        ), status
+                    else:
+                        assert f"peer {peer_id} progress unknown" in line, status
+            cluster_status = subprocess.run(
+                [str(client_executable), *(str(port) for port in ports), "status"],
+                text=True, capture_output=True, timeout=8,
+            )
+            assert cluster_status.returncode == 0, cluster_status
+            assert [line.split()[1] for line in cluster_status.stdout.splitlines()] == [
+                "1", "2", "3"
+            ], cluster_status
+            with socket.create_connection(("127.0.0.1", ports[follower - 1]), 2) as sock:
+                malformed_status = b"\x01\x09\x00"
+                sock.sendall(struct.pack(">I", len(malformed_status)) + malformed_status)
+                reply_size = struct.unpack(">I", recv_exact(sock, 4))[0]
+                reply = recv_exact(sock, reply_size)
+                assert reply_size == 100 and reply[:4] == b"\x01\x0a\x02\x00", reply
+
             rejected = client(follower, "put", "wrong", "value")
             assert rejected.returncode == 3 and "not leader" in rejected.stdout, rejected
             committed = client(leader, "put", "x", "10")
             assert committed.returncode == 0 and "committed term" in committed.stdout, committed
             term = int(re.search(r"committed term (\d+)", committed.stdout).group(1))
             collect_until(lambda: all("applied index 2" in seen[i] for i in active))
+            updated_status = client(leader, "status")
+            assert updated_status.returncode == 0 and (
+                " log 2 commit 2 applied 2" in updated_status.stdout
+            ), updated_status
             stale_read = client(follower, "get", "x")
             assert stale_read.returncode == 3 and "not leader" in stale_read.stdout, stale_read
             found = client(leader, "get", "x")
@@ -166,6 +243,7 @@ def main(server_executable, client_executable):
                 process.stdin.close()
                 process.stdout.close()
             selector.close()
+    check_isolated_candidate(server_executable, client_executable)
 
 
 if __name__ == "__main__":

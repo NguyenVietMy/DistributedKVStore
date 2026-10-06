@@ -12,8 +12,11 @@ namespace dkv {
         constexpr std::byte reply_kind{6};
         constexpr std::byte read_request_kind{7};
         constexpr std::byte read_reply_kind{8};
+        constexpr std::byte status_request_kind{9};
+        constexpr std::byte status_reply_kind{10};
         constexpr std::size_t reply_size = 27;
         constexpr std::size_t read_reply_size = 31;
+        constexpr std::size_t status_reply_size = 100;
 
         void put_u32(std::vector<std::byte>& bytes, std::uint32_t value) {
             for (int shift = 24; shift >= 0; shift -= 8) {
@@ -53,6 +56,39 @@ namespace dkv {
         bool valid_read_status(std::uint8_t value) {
             return value >= static_cast<std::uint8_t>(ClientReadStatus::Found) &&
                    value <= static_cast<std::uint8_t>(ClientReadStatus::InternalError);
+        }
+
+        bool valid_status_reply(const ClientStatusReply& reply) {
+            if (reply.status == ClientStatusCode::InvalidRequest) {
+                return reply.node_id == 0 && reply.role == ClientNodeRole::Unknown &&
+                       reply.term == 0 && reply.known_leader == 0 &&
+                       reply.last_index == 0 && reply.commit_index == 0 &&
+                       reply.last_applied == 0 &&
+                       reply.peers == std::array<ClientPeerStatus, 2>{};
+            }
+            if (reply.status != ClientStatusCode::Ok || reply.node_id == 0 ||
+                reply.role < ClientNodeRole::Follower ||
+                reply.role > ClientNodeRole::Leader ||
+                reply.last_applied > reply.commit_index ||
+                reply.commit_index > reply.last_index ||
+                reply.peers[0].id == 0 || reply.peers[1].id == 0 ||
+                reply.peers[0].id == reply.peers[1].id ||
+                reply.peers[0].id == reply.node_id ||
+                reply.peers[1].id == reply.node_id) {
+                return false;
+            }
+            if (reply.role == ClientNodeRole::Leader) {
+                if (reply.known_leader != reply.node_id) return false;
+                for (const auto& peer : reply.peers) {
+                    if (peer.next_index == 0 || peer.match_index >= peer.next_index ||
+                        peer.match_index > reply.last_index) return false;
+                }
+            } else {
+                for (const auto& peer : reply.peers) {
+                    if (peer.next_index != 0 || peer.match_index != 0) return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -198,5 +234,63 @@ namespace dkv {
         }
         return ClientReadReply{status, read_u64(bytes, 3), index,
                                read_u64(bytes, 19), std::move(value)};
+    }
+
+    EncodeClientResult encode_client_status_request(const ClientStatusRequest&) {
+        return std::vector<std::byte>{version, status_request_kind};
+    }
+
+    DecodeClientStatusRequestResult decode_client_status_request(
+        std::span<const std::byte> bytes) {
+        if (bytes.size() < 2) return ClientWireError::Truncated;
+        if (bytes.size() != 2) return ClientWireError::InvalidMessage;
+        if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (bytes[1] != status_request_kind) return ClientWireError::InvalidMessage;
+        return ClientStatusRequest{};
+    }
+
+    EncodeClientResult encode_client_status_reply(const ClientStatusReply& reply) {
+        if (!valid_status_reply(reply)) return ClientWireError::InvalidMessage;
+        std::vector<std::byte> bytes{version, status_reply_kind,
+                                     static_cast<std::byte>(reply.status),
+                                     static_cast<std::byte>(reply.role)};
+        put_u64(bytes, reply.node_id);
+        put_u64(bytes, reply.term);
+        put_u64(bytes, reply.known_leader);
+        put_u64(bytes, reply.last_index);
+        put_u64(bytes, reply.commit_index);
+        put_u64(bytes, reply.last_applied);
+        for (const auto& peer : reply.peers) {
+            put_u64(bytes, peer.id);
+            put_u64(bytes, peer.next_index);
+            put_u64(bytes, peer.match_index);
+        }
+        return bytes;
+    }
+
+    DecodeClientStatusReplyResult decode_client_status_reply(
+        std::span<const std::byte> bytes) {
+        if (bytes.size() < status_reply_size) return ClientWireError::Truncated;
+        if (bytes.size() != status_reply_size) return ClientWireError::InvalidMessage;
+        if (bytes[0] != version) return ClientWireError::UnsupportedVersion;
+        if (bytes[1] != status_reply_kind) return ClientWireError::InvalidMessage;
+        ClientStatusReply reply;
+        reply.status = static_cast<ClientStatusCode>(
+            std::to_integer<std::uint8_t>(bytes[2]));
+        reply.role = static_cast<ClientNodeRole>(
+            std::to_integer<std::uint8_t>(bytes[3]));
+        reply.node_id = read_u64(bytes, 4);
+        reply.term = read_u64(bytes, 12);
+        reply.known_leader = read_u64(bytes, 20);
+        reply.last_index = read_u64(bytes, 28);
+        reply.commit_index = read_u64(bytes, 36);
+        reply.last_applied = read_u64(bytes, 44);
+        for (std::size_t i = 0; i < reply.peers.size(); ++i) {
+            const auto at = 52 + i * 24;
+            reply.peers[i] = {read_u64(bytes, at), read_u64(bytes, at + 8),
+                              read_u64(bytes, at + 16)};
+        }
+        if (!valid_status_reply(reply)) return ClientWireError::InvalidMessage;
+        return reply;
     }
 }

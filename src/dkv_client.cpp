@@ -133,11 +133,13 @@ namespace {
 
     enum class ExchangeError { SocketUnavailable, ServerUnavailable,
                                ConnectionLost, InvalidReply };
+    enum class Operation { Write, Read, Status };
     using ExchangeResult = std::variant<dkv::ClientWriteReply,
-                                        dkv::ClientReadReply, ExchangeError>;
+                                        dkv::ClientReadReply,
+                                        dkv::ClientStatusReply, ExchangeError>;
 
     ExchangeResult exchange(std::uint16_t port, const std::vector<std::byte>& bytes,
-                            bool reading, Clock::time_point deadline) {
+                            Operation operation, Clock::time_point deadline) {
         const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0) {
             return ExchangeError::SocketUnavailable;
@@ -180,7 +182,13 @@ namespace {
         if (!received) {
             return ExchangeError::ConnectionLost;
         }
-        if (reading) {
+        if (operation == Operation::Status) {
+            const auto decoded = dkv::decode_client_status_reply(reply_bytes);
+            const auto* reply = std::get_if<dkv::ClientStatusReply>(&decoded);
+            if (!reply) return ExchangeError::InvalidReply;
+            return *reply;
+        }
+        if (operation == Operation::Read) {
             const auto decoded = dkv::decode_client_read_reply(reply_bytes);
             const auto* reply = std::get_if<dkv::ClientReadReply>(&decoded);
             if (!reply) return ExchangeError::InvalidReply;
@@ -192,7 +200,7 @@ namespace {
         return *reply;
     }
 
-    int show_result(const ExchangeResult& result, bool reading) {
+    int show_result(const ExchangeResult& result, Operation operation) {
         if (const auto* error = std::get_if<ExchangeError>(&result)) {
             switch (*error) {
             case ExchangeError::SocketUnavailable:
@@ -202,15 +210,43 @@ namespace {
                 std::cerr << "server unavailable\n";
                 return 5;
             case ExchangeError::ConnectionLost:
-                std::cerr << (reading ? "read unavailable; retry\n"
-                                      : "outcome unknown: connection closed or timed out\n");
+                std::cerr << (operation == Operation::Write
+                    ? "outcome unknown: connection closed or timed out\n"
+                    : operation == Operation::Read ? "read unavailable; retry\n"
+                    : "status unavailable; retry\n");
                 return 4;
             case ExchangeError::InvalidReply:
                 std::cerr << "invalid server reply\n";
                 return 5;
             }
         }
-        if (reading) {
+        if (operation == Operation::Status) {
+            const auto* reply = std::get_if<dkv::ClientStatusReply>(&result);
+            if (!reply) return 5;
+            if (reply->status == dkv::ClientStatusCode::InvalidRequest) {
+                std::cout << "invalid request\n";
+                return 2;
+            }
+            const char* role = reply->role == dkv::ClientNodeRole::Leader ? "leader" :
+                               reply->role == dkv::ClientNodeRole::Candidate ? "candidate" :
+                               "follower";
+            std::cout << "node " << reply->node_id << " role " << role
+                      << " term " << reply->term << " leader ";
+            if (reply->known_leader == 0) std::cout << "unknown";
+            else std::cout << reply->known_leader;
+            std::cout << " log " << reply->last_index
+                      << " commit " << reply->commit_index
+                      << " applied " << reply->last_applied;
+            for (const auto& peer : reply->peers) {
+                std::cout << " peer " << peer.id;
+                if (peer.next_index == 0) std::cout << " progress unknown";
+                else std::cout << " next " << peer.next_index
+                               << " match " << peer.match_index;
+            }
+            std::cout << '\n';
+            return 0;
+        }
+        if (operation == Operation::Read) {
             const auto* reply = std::get_if<dkv::ClientReadReply>(&result);
             if (!reply) return 5;
             switch (reply->status) {
@@ -270,18 +306,20 @@ namespace {
     }
 
     int run_single(std::uint16_t port, const dkv::EncodeClientResult& encoded,
-                   bool reading) {
+                   Operation operation) {
         const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
         if (!bytes) {
             std::cerr << "invalid or oversized request\n";
             return 2;
         }
-        return show_result(exchange(port, *bytes, reading,
-                                    Clock::now() + std::chrono::seconds(10)), reading);
+        const auto timeout = operation == Operation::Status
+            ? std::chrono::seconds(2) : std::chrono::seconds(10);
+        return show_result(exchange(port, *bytes, operation,
+                                    Clock::now() + timeout), operation);
     }
 
     int run_cluster(const std::array<std::uint16_t, 3>& ports,
-                    const dkv::EncodeClientResult& encoded, bool reading) {
+                    const dkv::EncodeClientResult& encoded, Operation operation) {
         const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
         if (!bytes) {
             std::cerr << "invalid or oversized request\n";
@@ -294,7 +332,7 @@ namespace {
             visited[target] = true;
             const auto attempt_deadline = std::min(
                 deadline, Clock::now() + std::chrono::seconds(1));
-            const auto result = exchange(ports[target], *bytes, reading,
+            const auto result = exchange(ports[target], *bytes, operation,
                                          attempt_deadline);
             std::uint64_t hint = 0;
             bool busy = false;
@@ -302,14 +340,14 @@ namespace {
                 if (reply->status == dkv::ClientReadStatus::Found ||
                     reply->status == dkv::ClientReadStatus::NotFound ||
                     reply->status == dkv::ClientReadStatus::InvalidRequest) {
-                    return show_result(result, reading);
+                    return show_result(result, operation);
                 }
                 hint = reply->leader_hint;
                 busy = reply->status == dkv::ClientReadStatus::Busy;
             } else if (const auto* reply = std::get_if<dkv::ClientWriteReply>(&result)) {
                 if (reply->status == dkv::ClientWriteStatus::Committed ||
                     reply->status == dkv::ClientWriteStatus::InvalidRequest) {
-                    return show_result(result, reading);
+                    return show_result(result, operation);
                 }
                 hint = reply->leader_hint;
                 busy = reply->status == dkv::ClientWriteStatus::Busy;
@@ -337,7 +375,7 @@ namespace {
                     deadline - Clock::now()));
             if (wait.count() > 0) std::this_thread::sleep_for(wait);
         }
-        std::cerr << (reading ? "read unavailable; retry\n"
+        std::cerr << (operation == Operation::Read ? "read unavailable; retry\n"
                               : "outcome unknown; retry with the same request id\n");
         return 4;
     }
@@ -346,10 +384,10 @@ namespace {
 int main(int argc, char** argv) {
     constexpr const char* usage =
         "usage: dkv_client PORT [put KEY VALUE [REQUEST_ID] | "
-        "delete KEY [REQUEST_ID] | get KEY]\n"
+        "delete KEY [REQUEST_ID] | get KEY | status]\n"
         "       dkv_client PORT1 PORT2 PORT3 [put KEY VALUE [REQUEST_ID] | "
-        "delete KEY [REQUEST_ID] | get KEY]\n";
-    if (argc < 4) {
+        "delete KEY [REQUEST_ID] | get KEY | status]\n";
+    if (argc < 3) {
         std::cerr << usage;
         return 2;
     }
@@ -359,10 +397,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string_view second = argv[2];
-    const bool cluster = second != "put" && second != "delete" && second != "get";
+    const bool cluster = second != "put" && second != "delete" &&
+                         second != "get" && second != "status";
     const int operation_at = cluster ? 4 : 2;
     if (cluster) {
-        if (argc < 6) {
+        if (argc < 5) {
             std::cerr << usage;
             return 2;
         }
@@ -373,9 +412,10 @@ int main(int argc, char** argv) {
         }
     }
     const std::string_view operation = argv[operation_at];
-    const auto execute = [&](const dkv::EncodeClientResult& encoded, bool reading) {
-        return cluster ? run_cluster(ports, encoded, reading)
-                       : run_single(ports[0], encoded, reading);
+    const auto execute = [&](const dkv::EncodeClientResult& encoded,
+                             Operation operation) {
+        return cluster ? run_cluster(ports, encoded, operation)
+                       : run_single(ports[0], encoded, operation);
     };
     if ((operation == "put" &&
          (argc == operation_at + 3 || argc == operation_at + 4)) ||
@@ -394,10 +434,20 @@ int main(int argc, char** argv) {
         const dkv::Command command{
             operation == "put" ? dkv::CommandType::Put : dkv::CommandType::Delete,
             argv[operation_at + 1], operation == "put" ? argv[operation_at + 2] : "", id};
-        return execute(dkv::encode_client_request({command}), false);
+        return execute(dkv::encode_client_request({command}), Operation::Write);
     }
     if (operation == "get" && argc == operation_at + 2) {
-        return execute(dkv::encode_client_read_request({argv[operation_at + 1]}), true);
+        return execute(dkv::encode_client_read_request({argv[operation_at + 1]}),
+                       Operation::Read);
+    }
+    if (operation == "status" && argc == operation_at + 1) {
+        const auto request = dkv::encode_client_status_request({});
+        if (!cluster) return run_single(ports[0], request, Operation::Status);
+        int result = 0;
+        for (const auto port : ports) {
+            if (run_single(port, request, Operation::Status) != 0) result = 5;
+        }
+        return result;
     }
     std::cerr << usage;
     return 2;

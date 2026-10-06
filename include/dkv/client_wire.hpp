@@ -2,6 +2,7 @@
 
 #include "dkv/command.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -60,6 +61,43 @@ namespace dkv {
         bool operator==(const ClientReadReply&) const = default;
     };
 
+    struct ClientStatusRequest {
+        bool operator==(const ClientStatusRequest&) const = default;
+    };
+
+    enum class ClientStatusCode : std::uint8_t {
+        Ok = 1,
+        InvalidRequest = 2
+    };
+
+    enum class ClientNodeRole : std::uint8_t {
+        Unknown = 0,
+        Follower = 1,
+        Candidate = 2,
+        Leader = 3
+    };
+
+    struct ClientPeerStatus {
+        std::uint64_t id{0};
+        // Both indices are zero when this node is not tracking the peer.
+        std::uint64_t next_index{0};
+        std::uint64_t match_index{0};
+        bool operator==(const ClientPeerStatus&) const = default;
+    };
+
+    struct ClientStatusReply {
+        ClientStatusCode status{ClientStatusCode::InvalidRequest};
+        std::uint64_t node_id{0};
+        ClientNodeRole role{ClientNodeRole::Unknown};
+        std::uint64_t term{0};
+        std::uint64_t known_leader{0};
+        std::uint64_t last_index{0};
+        std::uint64_t commit_index{0};
+        std::uint64_t last_applied{0};
+        std::array<ClientPeerStatus, 2> peers{};
+        bool operator==(const ClientStatusReply&) const = default;
+    };
+
     enum class ClientWireError {
         InvalidMessage,
         TooLarge,
@@ -75,6 +113,10 @@ namespace dkv {
         std::variant<ClientReadRequest, ClientWireError>;
     using DecodeClientReadReplyResult =
         std::variant<ClientReadReply, ClientWireError>;
+    using DecodeClientStatusRequestResult =
+        std::variant<ClientStatusRequest, ClientWireError>;
+    using DecodeClientStatusReplyResult =
+        std::variant<ClientStatusReply, ClientWireError>;
 
     [[nodiscard]] EncodeClientResult encode_client_request(
         const ClientWriteRequest& request);
@@ -91,5 +133,13 @@ namespace dkv {
     [[nodiscard]] EncodeClientResult encode_client_read_reply(
         const ClientReadReply& reply);
     [[nodiscard]] DecodeClientReadReplyResult decode_client_read_reply(
+        std::span<const std::byte> bytes);
+    [[nodiscard]] EncodeClientResult encode_client_status_request(
+        const ClientStatusRequest& request);
+    [[nodiscard]] DecodeClientStatusRequestResult decode_client_status_request(
+        std::span<const std::byte> bytes);
+    [[nodiscard]] EncodeClientResult encode_client_status_reply(
+        const ClientStatusReply& reply);
+    [[nodiscard]] DecodeClientStatusReplyResult decode_client_status_reply(
         std::span<const std::byte> bytes);
 }

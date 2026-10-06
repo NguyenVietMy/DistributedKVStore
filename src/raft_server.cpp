@@ -124,6 +124,26 @@ namespace {
                write_all(fd, bytes->data(), bytes->size());
     }
 
+    bool send_client_status_reply(int fd, const dkv::ClientStatusReply& reply) {
+        const auto encoded = dkv::encode_client_status_reply(reply);
+        const auto* bytes = std::get_if<std::vector<std::byte>>(&encoded);
+        if (!bytes) return false;
+        timeval timeout{0, 300000};
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        const auto prefix = length_prefix(bytes->size());
+        return write_all(fd, prefix.data(), prefix.size()) &&
+               write_all(fd, bytes->data(), bytes->size());
+    }
+
+    dkv::ClientNodeRole client_role(dkv::RaftRole role) {
+        switch (role) {
+        case dkv::RaftRole::Follower: return dkv::ClientNodeRole::Follower;
+        case dkv::RaftRole::Candidate: return dkv::ClientNodeRole::Candidate;
+        case dkv::RaftRole::Leader: return dkv::ClientNodeRole::Leader;
+        }
+        return dkv::ClientNodeRole::Unknown;
+    }
+
     enum class SendResult { Sent, Unavailable, InvalidMessage };
 
     SendResult send_frame(std::uint16_t port, const dkv::RaftEnvelope& envelope) {
@@ -460,6 +480,27 @@ namespace {
             process(proposed);
         }
 
+        void handle_client_status(Socket& connection,
+                                  std::span<const std::byte> bytes) {
+            if (!std::holds_alternative<dkv::ClientStatusRequest>(
+                    dkv::decode_client_status_request(bytes))) {
+                send_client_status_reply(connection.get(), {});
+                return;
+            }
+            std::array<dkv::ClientPeerStatus, 2> peers{};
+            const auto peer_ids = node_->peer_ids();
+            for (std::size_t i = 0; i < peers.size(); ++i) {
+                const auto progress = node_->peer_progress(peer_ids[i]);
+                peers[i] = {peer_ids[i], progress ? progress->next_index : 0,
+                            progress ? progress->match_index : 0};
+            }
+            send_client_status_reply(connection.get(),
+                {dkv::ClientStatusCode::Ok, node_->id(), client_role(node_->role()),
+                 node_->term(), node_->known_leader().value_or(0),
+                 node_->last_index(), node_->commit_index(), node_->last_applied(),
+                 peers});
+        }
+
         void receive_one() {
             Socket connection{::accept(listener_, nullptr, nullptr)};
             if (connection.get() < 0) return;
@@ -471,6 +512,10 @@ namespace {
             }
             if (bytes->size() >= 2 && (*bytes)[1] == std::byte{7}) {
                 handle_client_read(connection, *bytes);
+                return;
+            }
+            if (bytes->size() >= 2 && (*bytes)[1] == std::byte{9}) {
+                handle_client_status(connection, *bytes);
                 return;
             }
             const auto decoded = dkv::decode_raft_envelope(*bytes);

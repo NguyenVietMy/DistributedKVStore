@@ -50,6 +50,13 @@ namespace dkv {
     std::optional<std::uint64_t> RaftNode::known_leader() const noexcept {
         return known_leader_;
     }
+    std::array<std::uint64_t, 2> RaftNode::peer_ids() const noexcept {
+        return peer_ids_;
+    }
+    std::optional<PeerProgress> RaftNode::peer_progress(
+        std::uint64_t peer_id) const noexcept {
+        return leader_ && leader_->active() ? leader_->progress(peer_id) : std::nullopt;
+    }
     std::optional<std::string> RaftNode::get(const std::string& key) const {
         return state_.get(key);
     }

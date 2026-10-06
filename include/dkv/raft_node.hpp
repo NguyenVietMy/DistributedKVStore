@@ -107,6 +107,10 @@ namespace dkv {
         [[nodiscard]] std::uint64_t commit_index() const noexcept;
         [[nodiscard]] std::uint64_t last_applied() const noexcept;
         [[nodiscard]] std::optional<std::uint64_t> known_leader() const noexcept;
+        [[nodiscard]] std::array<std::uint64_t, 2> peer_ids() const noexcept;
+        // Only a leader tracks nextIndex and matchIndex for its followers.
+        [[nodiscard]] std::optional<PeerProgress> peer_progress(
+            std::uint64_t peer_id) const noexcept;
         // Local applied state inspection; this is not a linearizable client read.
         [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
         // Results are reconstructed by applying committed log entries after restart.

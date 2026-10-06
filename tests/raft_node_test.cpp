@@ -469,6 +469,53 @@ namespace {
                    std::vector<dkv::ReadyRead>{{*second_actions->started_read_id, 1}},
                "second read did not wait for its own acknowledgment");
     }
+
+    void test_status_progress_is_leader_only() {
+        ElectedCluster cluster;
+        if (!cluster.ready()) return;
+        expect(cluster.a.node->peer_ids() == std::array<std::uint64_t, 2>{2, 3} &&
+                   !cluster.a.node->peer_progress(2),
+               "follower reported leader replication progress");
+
+        const auto started = cluster.a.node->on_election_timeout();
+        const auto* started_actions = actions(started, "A did not become candidate");
+        if (!started_actions) return;
+        expect(cluster.a.node->role() == dkv::RaftRole::Candidate &&
+                   !cluster.a.node->peer_progress(2),
+               "candidate reported leader replication progress");
+        const auto request = message_to<dkv::RequestVote>(*started_actions, 2);
+        if (!request) return;
+        const auto voted = cluster.b.node->on_request_vote(1, *request);
+        const auto* voted_actions = actions(voted, "B did not grant vote");
+        if (!voted_actions) return;
+        const auto vote = message_to<dkv::RequestVoteReply>(*voted_actions, 1);
+        if (!vote) return;
+        const auto elected = cluster.a.node->on_vote_reply(2, *vote);
+        const auto* elected_actions = actions(elected, "A did not become leader");
+        if (!elected_actions) return;
+        expect(cluster.a.node->peer_progress(2) == dkv::PeerProgress{1, 0} &&
+                   cluster.a.node->peer_progress(3) == dkv::PeerProgress{1, 0} &&
+                   !cluster.a.node->peer_progress(99),
+               "new leader reported incorrect follower progress");
+
+        const auto append = message_to<dkv::AppendEntries>(*elected_actions, 2);
+        if (!append) return;
+        const auto stored = cluster.b.node->on_append_entries(1, *append);
+        const auto* stored_actions = actions(stored, "B did not store no-op");
+        if (!stored_actions) return;
+        const auto ack = message_to<dkv::AppendEntriesReply>(*stored_actions, 1);
+        if (!ack) return;
+        const auto committed = cluster.a.node->on_append_reply(2, *append, *ack);
+        expect(actions(committed, "A did not record follower progress") &&
+                   cluster.a.node->peer_progress(2) == dkv::PeerProgress{2, 1} &&
+                   cluster.a.node->peer_progress(3) == dkv::PeerProgress{1, 0},
+               "leader did not expose updated follower progress");
+
+        const auto stepped_down = cluster.a.node->on_request_vote(2, {2, 2, 0, 0});
+        expect(actions(stepped_down, "A did not step down") &&
+                   !cluster.a.node->peer_progress(2),
+               "former leader retained replication progress");
+    }
 }
 
 int main() {
@@ -479,6 +526,7 @@ int main() {
     test_higher_term_vote_request_resets_timer_even_when_denied();
     test_read_barrier_waits_for_current_term_and_fresh_quorum();
     test_concurrent_reads_require_their_own_fresh_ack();
+    test_status_progress_is_leader_only();
     if (failures != 0) std::cerr << failures << " Raft node tests failed\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -33,6 +33,7 @@ term, role, and log progress. Send client requests to the leader's port:
 ./build/dkv_client 9101 put x 10
 ./build/dkv_client 9101 get x
 ./build/dkv_client 9101 delete x
+./build/dkv_client 9101 status
 ```
 
 Or give the client all three ports in node-ID order so it can find the leader
@@ -41,7 +42,14 @@ and retry during failover:
 ```sh
 ./build/dkv_client 9101 9102 9103 put x 10
 ./build/dkv_client 9101 9102 9103 get x
+./build/dkv_client 9101 9102 9103 status
 ```
+
+`status` works on every node. With three ports, it prints all three local
+snapshots in node-ID order. Each includes role, term, known leader ID, and local
+log/commit/applied indices. A leader also reports each follower's `nextIndex`
+and `matchIndex`; other roles report peer progress as unknown. Status is a
+local diagnostic, not a quorum-confirmed read.
 
 The client reports `committed` only after the entry is applied by the leader.
 A follower returns `not leader` with a leader hint if it knows one. If the
