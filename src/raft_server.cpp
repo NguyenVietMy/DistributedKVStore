@@ -304,6 +304,7 @@ namespace {
                 pending_reads_.erase(pending);
             }
             for (const auto& outbound : actions->messages) {
+                if (blocked_peers_[outbound.peer_id - 1]) continue;
                 const auto port = ports_[outbound.peer_id - 1];
                 const auto correlation =
                     std::holds_alternative<dkv::AppendEntriesReply>(outbound.message)
@@ -523,6 +524,7 @@ namespace {
             if (!envelope) return;
             const auto sender = envelope->sender_id;
             if (sender < 1 || sender > 3 || sender == node_->id()) return;
+            if (blocked_peers_[sender - 1]) return;
             if (const auto* value = std::get_if<dkv::RequestVote>(&envelope->message)) {
                 process(node_->on_request_vote(sender, *value));
             } else if (const auto* value =
@@ -584,6 +586,25 @@ namespace {
                           << " log " << node_->last_index()
                           << " commit " << node_->commit_index()
                           << " applied " << node_->last_applied() << std::endl;
+            } else if (operation == "block" || operation == "unblock") {
+                std::string peer_text;
+                std::string extra;
+                unsigned peer = 0;
+                if (!(input >> peer_text) || (input >> extra)) {
+                    std::cout << "usage: " << operation << " PEER_ID\n";
+                    return;
+                }
+                const auto parsed = std::from_chars(
+                    peer_text.data(), peer_text.data() + peer_text.size(), peer);
+                if (parsed.ec != std::errc{} ||
+                    parsed.ptr != peer_text.data() + peer_text.size() ||
+                    peer < 1 || peer > 3 || peer == node_->id()) {
+                    std::cout << "invalid peer ID\n";
+                    return;
+                }
+                blocked_peers_[peer - 1] = operation == "block";
+                std::cout << "peer " << peer << (blocked_peers_[peer - 1]
+                    ? " blocked" : " unblocked") << std::endl;
             } else if (operation == "inspect" && input >> key) {
                 const auto value = node_->get(key);
                 std::cout << (value ? *value : "(not found)") << std::endl;
@@ -595,12 +616,13 @@ namespace {
                 process(node_->propose({dkv::CommandType::Delete, key, ""}));
             } else {
                 std::cout << "commands: status, put KEY VALUE, inspect KEY, "
-                             "delete KEY, quit\n";
+                             "delete KEY, block PEER_ID, unblock PEER_ID, quit\n";
             }
         }
 
         std::unique_ptr<dkv::RaftNode> node_;
         std::array<std::uint16_t, 3> ports_;
+        std::array<bool, 3> blocked_peers_{};
         int listener_;
         std::map<std::uint64_t, PendingWrite> pending_writes_;
         std::map<std::uint64_t, PendingRead> pending_reads_;

@@ -82,6 +82,11 @@ proposals: they print a log index without waiting for commitment. An
 applied it. `inspect x` shows only that node's local applied state; it is not a
 linearizable client read. Use `quit` to stop a node.
 
+For partition testing, the node console accepts `block PEER_ID` and
+`unblock PEER_ID`. These drop Raft messages to and from that peer on this
+node; issue the command on both sides to isolate a link. Client requests,
+including `status`, remain available while a peer is blocked.
+
 The current TCP transport is localhost-only. Raft messages use one short-lived
 connection each. A client request keeps its connection open until completion,
 step-down, or disconnection.
